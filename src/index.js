@@ -9,7 +9,9 @@ app.use(express.json({ limit: '1mb' }));
 const API = (process.env.BOXNOW_API_URL || '').replace(/\/$/, '');
 const CLIENT_ID = process.env.BOXNOW_CLIENT_ID;
 const CLIENT_SECRET = process.env.BOXNOW_CLIENT_SECRET;
-const PARTNER_ID = process.env.BOXNOW_PARTNER_ID; // ✅ set 9191 for STAGE (and different for PROD)
+const PARTNER_ID = process.env.BOXNOW_PARTNER_ID; // stage: 9191, prod: different
+const ALLOW_COD =
+  String(process.env.BOXNOW_ALLOW_COD || 'false').toLowerCase() === 'true'; // stage: false, prod: true
 
 let cachedToken = null;
 let tokenExpiry = null;
@@ -17,7 +19,7 @@ let tokenExpiry = null;
 const mapPaymentModeToBoxNow = (method) => {
   const normalized = String(method || '').toLowerCase();
 
-  // Keep distinct if you later need it; otherwise it maps to cod below.
+  // Keep distinct if your frontend uses it; otherwise it maps to cod below.
   if (normalized === 'pay_on_go') return 'pay_on_go';
 
   const prepaid = ['card', 'stripe', 'paypal', 'bank_transfer', 'prepaid'];
@@ -110,9 +112,17 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
     }
 
     const order = req.body || {};
-    const paymentMode = mapPaymentModeToBoxNow(order.paymentMode);
+
+    // payment mode from frontend
+    let paymentMode = mapPaymentModeToBoxNow(order.paymentMode);
+
+    // ✅ If COD/Pay-on-Go isn't enabled in STAGE, force prepaid to avoid P401
+    if (!ALLOW_COD && (paymentMode === 'cod' || paymentMode === 'pay_on_go')) {
+      paymentMode = 'prepaid';
+    }
 
     const invoiceValue = Number(order.invoiceValue || 0);
+
     const amountToBeCollected =
       paymentMode === 'cod' || paymentMode === 'pay_on_go'
         ? Number(order.amountToBeCollected ?? invoiceValue).toFixed(2)
@@ -177,6 +187,8 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
+
+
 
 
 
