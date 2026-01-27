@@ -9,7 +9,7 @@ app.use(express.json({ limit: '1mb' }));
 const API = (process.env.BOXNOW_API_URL || '').replace(/\/$/, '');
 const CLIENT_ID = process.env.BOXNOW_CLIENT_ID;
 const CLIENT_SECRET = process.env.BOXNOW_CLIENT_SECRET;
-const PARTNER_ID = process.env.BOXNOW_PARTNER_ID; // ✅ NEW
+const PARTNER_ID = process.env.BOXNOW_PARTNER_ID; // ✅ set 9191 for STAGE (and different for PROD)
 
 let cachedToken = null;
 let tokenExpiry = null;
@@ -17,23 +17,26 @@ let tokenExpiry = null;
 const mapPaymentModeToBoxNow = (method) => {
   const normalized = String(method || '').toLowerCase();
 
-  // Keep "pay_on_go" distinct if your frontend uses it
+  // Keep distinct if you later need it; otherwise it maps to cod below.
   if (normalized === 'pay_on_go') return 'pay_on_go';
 
   const prepaid = ['card', 'stripe', 'paypal', 'bank_transfer', 'prepaid'];
   const cod = ['cod', 'cash_on_delivery', 'boxnow_cod', 'pay_on_go'];
+
   if (cod.includes(normalized)) return 'cod';
   if (prepaid.includes(normalized)) return 'prepaid';
   return 'prepaid';
 };
 
+// Keep only digits (BoxNow often rejects +, spaces, etc.)
 const normalizePhone = (value) => String(value || '').replace(/\D/g, '');
 
+// Convert to ASCII/latin (some APIs reject Greek chars)
 const toLatin = (str = '') =>
   String(str || '')
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^\x00-\x7F]/g, '');
+    .replace(/[\u0300-\u036f]/g, '') // remove accents/diacritics
+    .replace(/[^\x00-\x7F]/g, ''); // drop non-ASCII chars
 
 async function authToken() {
   if (cachedToken && tokenExpiry && new Date() < tokenExpiry) return cachedToken;
@@ -116,10 +119,10 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
         : '0.00';
 
     const requestBody = {
-      partnerId: String(PARTNER_ID), // ✅ IMPORTANT (Stage/Prod different!)
+      partnerId: String(PARTNER_ID),
 
-      // ✅ safer than "same-day" unless BoxNow explicitly told you to use same-day
-      typeOfService: 'standard',
+      // ✅ allowed values per BoxNow: "same-day" or "next-day"
+      typeOfService: 'next-day',
 
       orderNumber: String(order.orderNumber),
       invoiceValue: invoiceValue.toFixed(2),
@@ -149,6 +152,7 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
       })),
     };
 
+    // Helpful guards
     if (!requestBody.destination.contactEmail) {
       return res.status(400).json({ message: 'Missing destination.contactEmail' });
     }
