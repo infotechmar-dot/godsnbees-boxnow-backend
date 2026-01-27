@@ -1,4 +1,3 @@
-
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -10,10 +9,6 @@ app.use(express.json({ limit: '1mb' }));
 const API = (process.env.BOXNOW_API_URL || '').replace(/\/$/, '');
 const CLIENT_ID = process.env.BOXNOW_CLIENT_ID;
 const CLIENT_SECRET = process.env.BOXNOW_CLIENT_SECRET;
-
-/* =========================
-   Auth helpers
-========================= */
 
 let cachedToken = null;
 let tokenExpiry = null;
@@ -27,10 +22,11 @@ const mapPaymentModeToBoxNow = (method) => {
   return 'prepaid';
 };
 
+// Keep only digits (BoxNow often rejects +, spaces, etc.)
+const normalizePhone = (value) => String(value || '').replace(/\D/g, '');
+
 async function authToken() {
-  if (cachedToken && tokenExpiry && new Date() < tokenExpiry) {
-    return cachedToken;
-  }
+  if (cachedToken && tokenExpiry && new Date() < tokenExpiry) return cachedToken;
 
   const res = await fetch(`${API}/api/v1/auth-sessions`, {
     method: 'POST',
@@ -43,23 +39,19 @@ async function authToken() {
   });
 
   const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`BoxNow auth failed: ${res.status} ${text}`);
-  }
+  if (!res.ok) throw new Error(`BoxNow auth failed: ${res.status} ${text}`);
 
   const data = JSON.parse(text);
   cachedToken = data.access_token;
 
   const expiresIn = Number(data.expires_in || 3600);
-  tokenExpiry = new Date(Date.now() + (expiresIn - 300) * 1000);
-
+  tokenExpiry = new Date(Date.now() + Math.max(0, expiresIn - 300) * 1000);
   return cachedToken;
 }
 
 async function boxnowFetch(path, opts = {}) {
   const token = await authToken();
   const url = `${API}${path.startsWith('/') ? '' : '/'}${path}`;
-
   return fetch(url, {
     ...opts,
     headers: {
@@ -69,13 +61,7 @@ async function boxnowFetch(path, opts = {}) {
   });
 }
 
-/* =========================
-   Routes
-========================= */
-
-app.get('/health', (_req, res) => {
-  res.json({ ok: true });
-});
+app.get('/health', (_req, res) => res.json({ ok: true }));
 
 app.get('/api/boxnow/origins', async (_req, res) => {
   try {
@@ -121,24 +107,20 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
       amountToBeCollected,
       allowReturn: false,
 
-      origin: {
-        locationId: String(order.originLocationId || ''),
-      },
+      origin: { locationId: String(order.originLocationId || '') },
 
-      // ✅ REQUIRED by BoxNow
+      // ✅ BoxNow requires destination.contactEmail + destination.contactNumber (digits only)
       destination: {
         locationId: String(order.destinationLocationId || ''),
         contactEmail: String(order.contactEmail || ''),
         contactName: String(order.contactName || ''),
-        contactNumber: String(order.contactPhone || ''),
+        contactNumber: normalizePhone(order.contactPhone), // ✅ HERE (removes + and non-digits)
       },
 
       items: (order.items || []).map((item) => ({
         id: String(item.id ?? ''),
         name: String(item.name ?? ''),
-        value: String(
-          Number(item.value ?? item.price ?? 0).toFixed(2)
-        ),
+        value: String(Number(item.value ?? item.price ?? 0).toFixed(2)),
         weight:
           typeof item.weight === 'string'
             ? Number(item.weight.replace(',', '.'))
@@ -146,16 +128,15 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
       })),
     };
 
-    // Guards – για να μην ξανασκάσει schema error
+    // Helpful guards (optional but recommended)
     if (!requestBody.destination.contactEmail) {
       return res.status(400).json({
-        message: 'Missing destination.contactEmail',
+        message: 'Missing destination.contactEmail (contactEmail) required for BoxNow',
       });
     }
-
     if (!requestBody.destination.contactNumber) {
       return res.status(400).json({
-        message: 'Missing destination.contactNumber',
+        message: 'Missing destination.contactNumber (contactPhone) required for BoxNow',
       });
     }
 
@@ -167,7 +148,6 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
 
     const text = await r.text();
     if (!r.ok) return res.status(r.status).send(text);
-
     res.type('json').send(text);
   } catch (e) {
     console.error('delivery-requests error:', e);
@@ -175,14 +155,10 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
   }
 });
 
-/* =========================
-   Server
-========================= */
-
 const PORT = Number(process.env.PORT || 3001);
-app.listen(PORT, () => {
-  console.log(`BoxNow server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`BoxNow server on http://localhost:${PORT}`));
+
+
 
 
 
