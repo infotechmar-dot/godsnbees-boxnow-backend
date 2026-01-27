@@ -9,12 +9,17 @@ app.use(express.json({ limit: '1mb' }));
 const API = (process.env.BOXNOW_API_URL || '').replace(/\/$/, '');
 const CLIENT_ID = process.env.BOXNOW_CLIENT_ID;
 const CLIENT_SECRET = process.env.BOXNOW_CLIENT_SECRET;
+const PARTNER_ID = process.env.BOXNOW_PARTNER_ID; // ✅ NEW
 
 let cachedToken = null;
 let tokenExpiry = null;
 
 const mapPaymentModeToBoxNow = (method) => {
   const normalized = String(method || '').toLowerCase();
+
+  // Keep "pay_on_go" distinct if your frontend uses it
+  if (normalized === 'pay_on_go') return 'pay_on_go';
+
   const prepaid = ['card', 'stripe', 'paypal', 'bank_transfer', 'prepaid'];
   const cod = ['cod', 'cash_on_delivery', 'boxnow_cod', 'pay_on_go'];
   if (cod.includes(normalized)) return 'cod';
@@ -22,15 +27,13 @@ const mapPaymentModeToBoxNow = (method) => {
   return 'prepaid';
 };
 
-// Keep only digits (BoxNow often rejects +, spaces, etc.)
 const normalizePhone = (value) => String(value || '').replace(/\D/g, '');
 
-// Convert to ASCII/latin (some APIs reject Greek chars)
 const toLatin = (str = '') =>
   String(str || '')
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '') // remove accents/diacritics
-    .replace(/[^\x00-\x7F]/g, '');  // drop non-ASCII chars
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\x00-\x7F]/g, '');
 
 async function authToken() {
   if (cachedToken && tokenExpiry && new Date() < tokenExpiry) return cachedToken;
@@ -97,17 +100,27 @@ app.get('/api/boxnow/destinations', async (req, res) => {
 
 app.post('/api/boxnow/delivery-requests', async (req, res) => {
   try {
+    if (!PARTNER_ID) {
+      return res.status(500).json({
+        message: 'BOXNOW_PARTNER_ID is not configured on the server',
+      });
+    }
+
     const order = req.body || {};
     const paymentMode = mapPaymentModeToBoxNow(order.paymentMode);
 
     const invoiceValue = Number(order.invoiceValue || 0);
     const amountToBeCollected =
-      paymentMode === 'cod'
+      paymentMode === 'cod' || paymentMode === 'pay_on_go'
         ? Number(order.amountToBeCollected ?? invoiceValue).toFixed(2)
         : '0.00';
 
     const requestBody = {
-      typeOfService: 'same-day',
+      partnerId: String(PARTNER_ID), // ✅ IMPORTANT (Stage/Prod different!)
+
+      // ✅ safer than "same-day" unless BoxNow explicitly told you to use same-day
+      typeOfService: 'standard',
+
       orderNumber: String(order.orderNumber),
       invoiceValue: invoiceValue.toFixed(2),
       paymentMode,
@@ -116,35 +129,31 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
 
       origin: { locationId: String(order.originLocationId || '') },
 
-      // ✅ BoxNow requires destination.contactEmail + destination.contactNumber (digits only)
       destination: {
         locationId: String(order.destinationLocationId || ''),
         contactEmail: String(order.contactEmail || ''),
-        contactName: toLatin(order.contactName || ''),              // ✅ latin-safe
-        contactNumber: normalizePhone(order.contactPhone || ''),    // ✅ digits-only
+        contactName: toLatin(order.contactName || ''),
+        contactNumber: normalizePhone(order.contactPhone || ''),
       },
 
       items: (order.items || []).map((item) => ({
         id: String(item.id ?? ''),
         name: String(item.name ?? ''),
         value: String(Number(item.value ?? item.price ?? 0).toFixed(2)),
-        weight:
+        weight: Math.max(
+          0.1,
           typeof item.weight === 'string'
             ? Number(item.weight.replace(',', '.'))
-            : Number(item.weight || 0),
+            : Number(item.weight || 0)
+        ),
       })),
     };
 
-    // Helpful guards (optional but recommended)
     if (!requestBody.destination.contactEmail) {
-      return res.status(400).json({
-        message: 'Missing destination.contactEmail (contactEmail) required for BoxNow',
-      });
+      return res.status(400).json({ message: 'Missing destination.contactEmail' });
     }
     if (!requestBody.destination.contactNumber) {
-      return res.status(400).json({
-        message: 'Missing destination.contactNumber (contactPhone) required for BoxNow',
-      });
+      return res.status(400).json({ message: 'Missing destination.contactNumber' });
     }
 
     const r = await boxnowFetch('/api/v1/delivery-requests', {
@@ -163,7 +172,7 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
 });
 
 const PORT = Number(process.env.PORT || 3001);
-app.listen(PORT, () => console.log(`BoxNow server on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
 
 
 
