@@ -94,26 +94,44 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
     const amountToBeCollected =
       paymentMode === 'cod'
         ? Number(order.amountToBeCollected ?? invoiceValue).toFixed(2)
-        : "0.00";
+        : '0.00';
 
     const requestBody = {
-      typeOfService: "same-day",
+      typeOfService: 'same-day',
       orderNumber: String(order.orderNumber),
       invoiceValue: invoiceValue.toFixed(2),
       paymentMode,
       amountToBeCollected,
       allowReturn: false,
+
       origin: { locationId: String(order.originLocationId || '') },
-      destination: { locationId: String(order.destinationLocationId || '') },
+
+      // ✅ FIX: Pass contactEmail/name/phone inside destination (BoxNow requires destination.contactEmail)
+      destination: {
+        locationId: String(order.destinationLocationId || ''),
+        contactEmail: String(order.contactEmail || ''),
+        contactName: String(order.contactName || ''),
+        contactPhone: String(order.contactPhone || ''),
+      },
+
       items: (order.items || []).map((item) => ({
         id: String(item.id ?? ''),
         name: String(item.name ?? ''),
         value: String(Number(item.value ?? item.price ?? 0).toFixed(2)),
-        weight: typeof item.weight === 'string'
-          ? Number(item.weight.replace(',', '.'))
-          : Number(item.weight || 0),
+        weight:
+          typeof item.weight === 'string'
+            ? Number(item.weight.replace(',', '.'))
+            : Number(item.weight || 0),
       })),
     };
+
+    // (Optional but helpful) return a clear 400 before calling BoxNow if email is missing
+    if (!requestBody.destination.contactEmail) {
+      return res.status(400).json({
+        message: 'Missing destination.contactEmail (contactEmail) required for BoxNow',
+        receivedKeys: Object.keys(order),
+      });
+    }
 
     const r = await boxnowFetch('/api/v1/delivery-requests', {
       method: 'POST',
@@ -132,3 +150,5 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server on http://localhost:${PORT}`));
+
+
