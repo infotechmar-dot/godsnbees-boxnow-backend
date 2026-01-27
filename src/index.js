@@ -106,12 +106,12 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
 
       origin: { locationId: String(order.originLocationId || '') },
 
-      // ✅ FIX: Pass contactEmail/name/phone inside destination (BoxNow requires destination.contactEmail)
+      // ✅ FIX: BoxNow requires destination.contactEmail and destination.contactNumber
       destination: {
         locationId: String(order.destinationLocationId || ''),
         contactEmail: String(order.contactEmail || ''),
         contactName: String(order.contactName || ''),
-        contactPhone: String(order.contactPhone || ''),
+        contactNumber: String(order.contactPhone || ''),
       },
 
       items: (order.items || []).map((item) => ({
@@ -125,10 +125,16 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
       })),
     };
 
-    // (Optional but helpful) return a clear 400 before calling BoxNow if email is missing
+    // Helpful guards (optional)
     if (!requestBody.destination.contactEmail) {
       return res.status(400).json({
         message: 'Missing destination.contactEmail (contactEmail) required for BoxNow',
+        receivedKeys: Object.keys(order),
+      });
+    }
+    if (!requestBody.destination.contactNumber) {
+      return res.status(400).json({
+        message: 'Missing destination.contactNumber (phone) required for BoxNow',
         receivedKeys: Object.keys(order),
       });
     }
@@ -150,5 +156,10 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server on http://localhost:${PORT}`));
+
+
+const PORT = Number(process.env.PORT || 3001);
+app.listen(PORT, () => console.log(`BoxNow server on http://localhost:${PORT}`));
+
 
 
