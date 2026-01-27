@@ -25,6 +25,13 @@ const mapPaymentModeToBoxNow = (method) => {
 // Keep only digits (BoxNow often rejects +, spaces, etc.)
 const normalizePhone = (value) => String(value || '').replace(/\D/g, '');
 
+// Convert to ASCII/latin (some APIs reject Greek chars)
+const toLatin = (str = '') =>
+  String(str || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // remove accents/diacritics
+    .replace(/[^\x00-\x7F]/g, '');  // drop non-ASCII chars
+
 async function authToken() {
   if (cachedToken && tokenExpiry && new Date() < tokenExpiry) return cachedToken;
 
@@ -113,8 +120,8 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
       destination: {
         locationId: String(order.destinationLocationId || ''),
         contactEmail: String(order.contactEmail || ''),
-        contactName: String(order.contactName || ''),
-        contactNumber: normalizePhone(order.contactPhone), // ✅ HERE (removes + and non-digits)
+        contactName: toLatin(order.contactName || ''),              // ✅ latin-safe
+        contactNumber: normalizePhone(order.contactPhone || ''),    // ✅ digits-only
       },
 
       items: (order.items || []).map((item) => ({
@@ -157,6 +164,8 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server on http://localhost:${PORT}`));
+
+
 
 
 
