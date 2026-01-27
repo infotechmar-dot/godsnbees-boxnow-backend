@@ -9,37 +9,32 @@ app.use(express.json({ limit: '1mb' }));
 const API = (process.env.BOXNOW_API_URL || '').replace(/\/$/, '');
 const CLIENT_ID = process.env.BOXNOW_CLIENT_ID;
 const CLIENT_SECRET = process.env.BOXNOW_CLIENT_SECRET;
-const PARTNER_ID = process.env.BOXNOW_PARTNER_ID; // STAGE: 9191 (PROD: different)
-const ALLOW_COD =
-  String(process.env.BOXNOW_ALLOW_COD || 'false').toLowerCase() === 'true'; // STAGE usually: false
-const WAREHOUSE_ID = String(process.env.BOXNOW_WAREHOUSE_ID || '2'); // ✅ per BoxNow instructions: 2 in STAGE & PROD
+const PARTNER_ID = process.env.BOXNOW_PARTNER_ID;      // STAGE: 9191 (PROD: different)
+const WAREHOUSE_ID = String(process.env.BOXNOW_WAREHOUSE_ID || '2'); // ✅ BoxNow: Warehouse ID = 2 (STAGE & PROD)
 
 let cachedToken = null;
 let tokenExpiry = null;
 
+const normalizePhone = (value) => String(value || '').replace(/\D/g, '');
+
+const toLatin = (str = '') =>
+  String(str || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\x00-\x7F]/g, '');
+
+// ✅ STAGE SAFE: force prepaid (BoxNow stage often doesn't allow COD/Pay-on-Go)
+const FORCE_PREPAID_STAGE =
+  String(process.env.BOXNOW_FORCE_PREPAID_STAGE || 'true').toLowerCase() === 'true';
+
 const mapPaymentModeToBoxNow = (method) => {
   const normalized = String(method || '').toLowerCase();
-
-  // If your frontend ever sends this, keep it explicit; otherwise it maps to cod below.
-  if (normalized === 'pay_on_go') return 'pay_on_go';
-
   const prepaid = ['card', 'stripe', 'paypal', 'bank_transfer', 'prepaid'];
   const cod = ['cod', 'cash_on_delivery', 'boxnow_cod', 'pay_on_go'];
-
   if (cod.includes(normalized)) return 'cod';
   if (prepaid.includes(normalized)) return 'prepaid';
   return 'prepaid';
 };
-
-// Keep only digits (BoxNow often rejects +, spaces, etc.)
-const normalizePhone = (value) => String(value || '').replace(/\D/g, '');
-
-// Convert to ASCII/latin (some APIs reject Greek chars)
-const toLatin = (str = '') =>
-  String(str || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '') // remove accents/diacritics
-    .replace(/[^\x00-\x7F]/g, ''); // drop non-ASCII chars
 
 async function authToken() {
   if (cachedToken && tokenExpiry && new Date() < tokenExpiry) return cachedToken;
@@ -107,43 +102,28 @@ app.get('/api/boxnow/destinations', async (req, res) => {
 app.post('/api/boxnow/delivery-requests', async (req, res) => {
   try {
     if (!PARTNER_ID) {
-      return res.status(500).json({
-        message: 'BOXNOW_PARTNER_ID is not configured on the server',
-      });
+      return res.status(500).json({ message: 'BOXNOW_PARTNER_ID is not configured on the server' });
     }
-
-    const order = req.body || {};
-
-    // payment mode from frontend
-    let paymentMode = mapPaymentModeToBoxNow(order.paymentMode);
-
-    // ✅ If COD/Pay-on-Go isn't enabled in STAGE, force prepaid to avoid P401
-    if (!ALLOW_COD && (paymentMode === 'cod' || paymentMode === 'pay_on_go')) {
-      paymentMode = 'prepaid';
-    }
-
-    const invoiceValue = Number(order.invoiceValue || 0);
-
-    const amountToBeCollected =
-      paymentMode === 'cod' || paymentMode === 'pay_on_go'
-        ? Number(order.amountToBeCollected ?? invoiceValue).toFixed(2)
-        : '0.00';
-
-    const destinationId = String(order.destinationLocationId || '');
-
-    // ✅ per BoxNow instructions:
-    // Warehouse ID = 2 (origin), Locker ID = 4 (destination test)
     if (!WAREHOUSE_ID) {
       return res.status(500).json({ message: 'BOXNOW_WAREHOUSE_ID is not configured on the server' });
     }
+
+    const order = req.body || {};
+    const destinationId = String(order.destinationLocationId || '');
+
     if (!destinationId) {
       return res.status(400).json({ message: 'Missing destinationLocationId (Locker ID)' });
     }
     if (WAREHOUSE_ID === destinationId) {
-      return res.status(400).json({
-        message: 'Warehouse ID and Locker ID must be different (e.g. 2 ≠ 4)',
-      });
+      return res.status(400).json({ message: 'Warehouse ID and Locker ID must be different (2 ≠ 4)' });
     }
+
+    const invoiceValue = Number(order.invoiceValue || 0);
+
+    // ✅ STAGE workaround: always prepaid + 0.00 collected
+    let paymentMode = FORCE_PREPAID_STAGE ? 'prepaid' : mapPaymentModeToBoxNow(order.paymentMode);
+    const amountToBeCollected =
+      paymentMode === 'cod' ? Number(order.amountToBeCollected ?? invoiceValue).toFixed(2) : '0.00';
 
     const requestBody = {
       partnerId: String(PARTNER_ID),
@@ -157,9 +137,10 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
       amountToBeCollected,
       allowReturn: false,
 
-      // ✅ origin must be the Warehouse ID (per BoxNow instructions)
+      // ✅ per BoxNow instructions: Warehouse ID = 2
       origin: { locationId: String(WAREHOUSE_ID) },
 
+      // ✅ per BoxNow instructions: test locker id = 4
       destination: {
         locationId: destinationId,
         contactEmail: String(order.contactEmail || ''),
@@ -180,7 +161,6 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
       })),
     };
 
-    // Helpful guards
     if (!requestBody.destination.contactEmail) {
       return res.status(400).json({ message: 'Missing destination.contactEmail' });
     }
@@ -205,7 +185,6 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
-
 
 
 
