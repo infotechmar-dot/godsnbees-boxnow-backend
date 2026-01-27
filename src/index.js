@@ -9,9 +9,10 @@ app.use(express.json({ limit: '1mb' }));
 const API = (process.env.BOXNOW_API_URL || '').replace(/\/$/, '');
 const CLIENT_ID = process.env.BOXNOW_CLIENT_ID;
 const CLIENT_SECRET = process.env.BOXNOW_CLIENT_SECRET;
-const PARTNER_ID = process.env.BOXNOW_PARTNER_ID; // stage: 9191, prod: different
+const PARTNER_ID = process.env.BOXNOW_PARTNER_ID; // STAGE: 9191 (PROD: different)
 const ALLOW_COD =
-  String(process.env.BOXNOW_ALLOW_COD || 'false').toLowerCase() === 'true'; // stage: false, prod: true
+  String(process.env.BOXNOW_ALLOW_COD || 'false').toLowerCase() === 'true'; // STAGE usually: false
+const WAREHOUSE_ID = String(process.env.BOXNOW_WAREHOUSE_ID || '2'); // ✅ per BoxNow instructions: 2 in STAGE & PROD
 
 let cachedToken = null;
 let tokenExpiry = null;
@@ -19,7 +20,7 @@ let tokenExpiry = null;
 const mapPaymentModeToBoxNow = (method) => {
   const normalized = String(method || '').toLowerCase();
 
-  // Keep distinct if your frontend uses it; otherwise it maps to cod below.
+  // If your frontend ever sends this, keep it explicit; otherwise it maps to cod below.
   if (normalized === 'pay_on_go') return 'pay_on_go';
 
   const prepaid = ['card', 'stripe', 'paypal', 'bank_transfer', 'prepaid'];
@@ -128,6 +129,22 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
         ? Number(order.amountToBeCollected ?? invoiceValue).toFixed(2)
         : '0.00';
 
+    const destinationId = String(order.destinationLocationId || '');
+
+    // ✅ per BoxNow instructions:
+    // Warehouse ID = 2 (origin), Locker ID = 4 (destination test)
+    if (!WAREHOUSE_ID) {
+      return res.status(500).json({ message: 'BOXNOW_WAREHOUSE_ID is not configured on the server' });
+    }
+    if (!destinationId) {
+      return res.status(400).json({ message: 'Missing destinationLocationId (Locker ID)' });
+    }
+    if (WAREHOUSE_ID === destinationId) {
+      return res.status(400).json({
+        message: 'Warehouse ID and Locker ID must be different (e.g. 2 ≠ 4)',
+      });
+    }
+
     const requestBody = {
       partnerId: String(PARTNER_ID),
 
@@ -140,10 +157,11 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
       amountToBeCollected,
       allowReturn: false,
 
-      origin: { locationId: String(order.originLocationId || '') },
+      // ✅ origin must be the Warehouse ID (per BoxNow instructions)
+      origin: { locationId: String(WAREHOUSE_ID) },
 
       destination: {
-        locationId: String(order.destinationLocationId || ''),
+        locationId: destinationId,
         contactEmail: String(order.contactEmail || ''),
         contactName: toLatin(order.contactName || ''),
         contactNumber: normalizePhone(order.contactPhone || ''),
@@ -187,9 +205,6 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
-
-
-
 
 
 
