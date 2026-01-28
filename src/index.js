@@ -42,9 +42,7 @@ function ensureEnv() {
 
 // Location API base (stage/prod)
 function locationBase() {
-  const inferred =
-    BOXNOW_ENV ||
-    (API_BASE.includes("production") ? "production" : "stage");
+  const inferred = BOXNOW_ENV || (API_BASE.includes("production") ? "production" : "stage");
 
   return inferred === "production"
     ? "https://locationapi-production.boxnow.gr/api/v1"
@@ -111,8 +109,8 @@ async function authToken() {
     body: JSON.stringify({
       grant_type: "client_credentials",
       client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
-    }),
+      client_secret: CLIENT_SECRET
+    })
   });
 
   const text = await res.text();
@@ -132,7 +130,7 @@ async function authToken() {
 function buildHeaders(token) {
   const h = {
     Authorization: `Bearer ${token}`,
-    accept: "application/json",
+    accept: "application/json"
   };
   if (PARTNER_ID) h["X-PartnerID"] = PARTNER_ID;
   return h;
@@ -146,8 +144,8 @@ async function boxnowApiFetch(path, opts = {}) {
     headers: {
       ...buildHeaders(token),
       "Content-Type": "application/json",
-      ...(opts.headers || {}),
-    },
+      ...(opts.headers || {})
+    }
   });
 }
 
@@ -155,7 +153,7 @@ async function boxnowApiFetch(path, opts = {}) {
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 /**
- * ✅ DESTINATIONS from Location API WITH AUTH (fixes your 401)
+ * ✅ DESTINATIONS from Location API WITH AUTH
  */
 app.get("/api/boxnow/destinations", async (req, res) => {
   try {
@@ -164,10 +162,7 @@ app.get("/api/boxnow/destinations", async (req, res) => {
     const url = `${base}/destinations${qs ? `?${qs}` : ""}`;
 
     const token = await authToken();
-
-    const r = await fetch(url, {
-      headers: buildHeaders(token),
-    });
+    const r = await fetch(url, { headers: buildHeaders(token) });
 
     const text = await r.text();
     if (!r.ok) return res.status(r.status).send(text);
@@ -189,10 +184,7 @@ app.get("/api/boxnow/origins", async (req, res) => {
     const url = `${base}/origins${qs ? `?${qs}` : ""}`;
 
     const token = await authToken();
-
-    const r = await fetch(url, {
-      headers: buildHeaders(token),
-    });
+    const r = await fetch(url, { headers: buildHeaders(token) });
 
     const text = await r.text();
     if (!r.ok) return res.status(r.status).send(text);
@@ -205,7 +197,7 @@ app.get("/api/boxnow/origins", async (req, res) => {
 });
 
 /**
- * ✅ Delivery Requests - correct schema for BoxNow
+ * ✅ Delivery Requests - creates shipment
  */
 app.post("/api/boxnow/delivery-requests", async (req, res) => {
   try {
@@ -247,12 +239,11 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
           name: customerName || null,
           email: customerEmail || null,
           phone: customerPhoneRaw || null,
-          normalizedPhone: customerPhone || null,
-        },
+          normalizedPhone: customerPhone || null
+        }
       });
     }
 
-    // parcel weight (try from weightKg/weight or sum of items)
     const totalWeightKg =
       Number(order.weightKg ?? order.weight ?? 0) ||
       (Array.isArray(order.items)
@@ -263,7 +254,6 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
       order.compartmentSize ?? order.items?.[0]?.compartmentSize ?? 2
     );
 
-    // AnyAPM origin=2 requires valid 1/2/3
     if (originLocationId === "2" && ![1, 2, 3].includes(compartmentSize)) {
       return res.status(400).json({ error: "Invalid compartmentSize (must be 1/2/3)" });
     }
@@ -273,38 +263,36 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
       invoiceValue,
       paymentMode,
       amountToBeCollected,
-
       origin: {
         locationId: originLocationId,
         contactName: String(customerName),
         contactEmail: String(customerEmail),
         contactNumber: String(customerPhone),
-        country: "GR",
+        country: "GR"
       },
       destination: {
         locationId: String(destinationLocationId),
         contactName: String(customerName),
         contactEmail: String(customerEmail),
         contactNumber: String(customerPhone),
-        country: "GR",
+        country: "GR"
       },
-
       items: [
         {
           id: "1",
           name: String(order.parcelName || "Order"),
           value: invoiceValue,
           weight: normalizeWeightToGrams(totalWeightKg),
-          compartmentSize,
-        },
-      ],
+          compartmentSize
+        }
+      ]
     };
 
     console.log("📦 BoxNow delivery request payload:\n", JSON.stringify(deliveryRequest, null, 2));
 
     const r = await boxnowApiFetch("/api/v1/delivery-requests", {
       method: "POST",
-      body: JSON.stringify(deliveryRequest),
+      body: JSON.stringify(deliveryRequest)
     });
 
     const text = await r.text();
@@ -321,6 +309,79 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
   }
 });
 
+/**
+ * ✅ PDF label for a whole delivery request (orderNumber)
+ * GET /api/v1/delivery-requests/{orderNumber}/label.pdf
+ */
+app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
+  try {
+    const orderNumber = String(req.params.orderNumber || "").trim();
+    if (!orderNumber) return res.status(400).json({ error: "Missing orderNumber" });
+
+    const token = await authToken();
+    const url = `${API_BASE}/api/v1/delivery-requests/${encodeURIComponent(orderNumber)}/label.pdf`;
+
+    const r = await fetch(url, {
+      method: "GET",
+      headers: {
+        ...buildHeaders(token),
+        accept: "application/pdf"
+      }
+    });
+
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      return res.status(r.status).send(txt || `Label fetch failed (${r.status})`);
+    }
+
+    const buf = Buffer.from(await r.arrayBuffer());
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="BOXNOW-${orderNumber}.pdf"`);
+    return res.status(200).send(buf);
+  } catch (e) {
+    console.error("label(order) error:", e);
+    return res.status(502).json({ message: "BoxNow order label error", details: String(e?.message || e) });
+  }
+});
+
+/**
+ * ✅ PDF label for a single parcel (parcelId)
+ * GET /api/v1/parcels/{parcelId}/label.pdf
+ */
+app.get("/api/boxnow/labels/parcel/:parcelId", async (req, res) => {
+  try {
+    const parcelId = String(req.params.parcelId || "").trim();
+    if (!parcelId) return res.status(400).json({ error: "Missing parcelId" });
+
+    const token = await authToken();
+    const url = `${API_BASE}/api/v1/parcels/${encodeURIComponent(parcelId)}/label.pdf`;
+
+    const r = await fetch(url, {
+      method: "GET",
+      headers: {
+        ...buildHeaders(token),
+        accept: "application/pdf"
+      }
+    });
+
+    if (!r.ok) {
+      const txt = await r.text().catch(() => "");
+      return res.status(r.status).send(txt || `Label fetch failed (${r.status})`);
+    }
+
+    const buf = Buffer.from(await r.arrayBuffer());
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="BOXNOW-PARCEL-${parcelId}.pdf"`);
+    return res.status(200).send(buf);
+  } catch (e) {
+    console.error("label(parcel) error:", e);
+    return res.status(502).json({ message: "BoxNow parcel label error", details: String(e?.message || e) });
+  }
+});
+
+// ✅ ALWAYS last
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
 
