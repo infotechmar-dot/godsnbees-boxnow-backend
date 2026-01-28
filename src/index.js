@@ -1,6 +1,5 @@
 import express from "express";
 import cors from "cors";
-import fetch from "node-fetch";
 
 const app = express();
 app.use(cors());
@@ -15,7 +14,7 @@ const CLIENT_SECRET = process.env.BOXNOW_CLIENT_SECRET;
 const PARTNER_ID = process.env.BOXNOW_PARTNER_ID;
 
 /* =========================
-   AUTH TOKEN
+   AUTH TOKEN (CACHE)
 ========================= */
 let cachedToken = null;
 let tokenExpiresAt = 0;
@@ -35,8 +34,8 @@ async function getBoxNowToken() {
   });
 
   if (!res.ok) {
-    const txt = await res.text();
-    throw new Error("BoxNow auth failed: " + txt);
+    const text = await res.text();
+    throw new Error("BoxNow auth failed: " + text);
   }
 
   const data = await res.json();
@@ -65,7 +64,6 @@ app.post("/api/boxnow/delivery-request", async (req, res) => {
       items,
     } = req.body;
 
-    /* ===== BASIC VALIDATION ===== */
     if (
       !orderNumber ||
       !destinationLocationId ||
@@ -74,20 +72,12 @@ app.post("/api/boxnow/delivery-request", async (req, res) => {
       !Array.isArray(items) ||
       items.length === 0
     ) {
-      return res.status(400).json({
-        error: "Missing required fields",
-      });
+      return res.status(400).json({ error: "Missing required fields" });
     }
 
     const safeMoney = (v) => Number(Number(v).toFixed(2));
 
-    /* =========================
-       !!! CRITICAL !!!
-       NO typeOfService
-       NO deliveryType
-       NO serviceLevel
-    ========================= */
-    const requestBody = {
+    const payload = {
       orderNumber: String(orderNumber),
       invoiceValue: safeMoney(invoiceValue),
       paymentMode: paymentMode || "prepaid",
@@ -95,13 +85,13 @@ app.post("/api/boxnow/delivery-request", async (req, res) => {
       allowReturn: false,
 
       origin: {
-        locationId: "2", // WAREHOUSE ID (BoxNow οδηγίες)
+        locationId: "2", // WAREHOUSE ID (BoxNow οδηγία)
       },
 
       destination: {
         locationId: String(destinationLocationId), // LOCKER ID
         contactName: String(customerName),
-        contactEmail: customerEmail ? String(customerEmail) : undefined,
+        contactEmail: customerEmail || undefined,
         contactNumber: String(customerPhone),
       },
 
@@ -114,7 +104,7 @@ app.post("/api/boxnow/delivery-request", async (req, res) => {
       })),
     };
 
-    const boxnowRes = await fetch(
+    const response = await fetch(
       `${BOXNOW_API_URL}/delivery-requests`,
       {
         method: "POST",
@@ -123,20 +113,18 @@ app.post("/api/boxnow/delivery-request", async (req, res) => {
           "Content-Type": "application/json",
           "X-Partner-Id": PARTNER_ID,
         },
-        body: JSON.stringify(requestBody),
+        body: JSON.stringify(payload),
       }
     );
 
-    const responseText = await boxnowRes.text();
+    const text = await response.text();
 
-    if (!boxnowRes.ok) {
-      console.error("BOXNOW ERROR:", responseText);
-      return res.status(boxnowRes.status).json(
-        JSON.parse(responseText)
-      );
+    if (!response.ok) {
+      console.error("BOXNOW ERROR:", text);
+      return res.status(response.status).json(JSON.parse(text));
     }
 
-    return res.json(JSON.parse(responseText));
+    return res.json(JSON.parse(text));
   } catch (err) {
     console.error("SERVER ERROR:", err);
     return res.status(500).json({ error: err.message });
@@ -147,7 +135,7 @@ app.post("/api/boxnow/delivery-request", async (req, res) => {
    HEALTH CHECK
 ========================= */
 app.get("/", (_, res) => {
-  res.send("BoxNow backend running");
+  res.send("BoxNow backend running OK");
 });
 
 /* =========================
@@ -157,4 +145,5 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () =>
   console.log(`BoxNow backend listening on ${PORT}`)
 );
+
 
