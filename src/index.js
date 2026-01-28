@@ -12,7 +12,7 @@ const CLIENT_ID = process.env.BOXNOW_CLIENT_ID;
 const CLIENT_SECRET = process.env.BOXNOW_CLIENT_SECRET;
 
 const PARTNER_ID = (process.env.BOXNOW_PARTNER_ID || "").trim();
-const DEFAULT_ORIGIN_LOCATION_ID = String(process.env.BOXNOW_WAREHOUSE_ID || "2"); // AnyAPM=2 :contentReference[oaicite:2]{index=2}
+const DEFAULT_ORIGIN_LOCATION_ID = String(process.env.BOXNOW_WAREHOUSE_ID || "2"); // AnyAPM=2
 
 const ALLOW_COD = String(process.env.BOXNOW_ALLOW_COD || "false").toLowerCase() === "true";
 const FORCE_PREPAID = String(process.env.BOXNOW_FORCE_PREPAID_ST || "false").toLowerCase() === "true";
@@ -40,7 +40,7 @@ function ensureEnv() {
   }
 }
 
-// Location API base from manual :contentReference[oaicite:3]{index=3}
+// Location API base (stage/prod)
 function locationBase() {
   const inferred =
     BOXNOW_ENV ||
@@ -57,7 +57,7 @@ function safeMoney(n) {
   return Number.isFinite(x) ? x.toFixed(2) : "0.00";
 }
 
-// BoxNow wants international phone format e.g. +30... :contentReference[oaicite:4]{index=4}
+// BoxNow wants international phone format e.g. +30...
 function normalizePhone(phoneRaw) {
   let p = String(phoneRaw || "").trim().replace(/\s+/g, "");
   if (!p) return "";
@@ -71,7 +71,7 @@ function normalizePhone(phoneRaw) {
   return `+${p}`;
 }
 
-// only allowed: prepaid | cod :contentReference[oaicite:5]{index=5}
+// only allowed: prepaid | cod
 function mapPaymentModeToBoxNow(method) {
   const normalized = String(method || "").toLowerCase();
   const prepaid = ["card", "stripe", "paypal", "bank_transfer", "bank transfer", "prepaid"];
@@ -105,15 +105,14 @@ async function authToken() {
   const now = Date.now();
   if (cachedToken && now < tokenExpiryMs - 30_000) return cachedToken;
 
-  // Manual: POST /api/v1/auth-sessions :contentReference[oaicite:6]{index=6}
   const res = await fetch(`${API_BASE}/api/v1/auth-sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json", accept: "application/json" },
     body: JSON.stringify({
       grant_type: "client_credentials",
       client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET
-    })
+      client_secret: CLIENT_SECRET,
+    }),
   });
 
   const text = await res.text();
@@ -130,13 +129,11 @@ async function authToken() {
   return cachedToken;
 }
 
-function boxnowHeaders(token) {
+function buildHeaders(token) {
   const h = {
     Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json",
-    accept: "application/json"
+    accept: "application/json",
   };
-  // Manual recommends X-PartnerID when needed :contentReference[oaicite:7]{index=7}
   if (PARTNER_ID) h["X-PartnerID"] = PARTNER_ID;
   return h;
 }
@@ -147,9 +144,10 @@ async function boxnowApiFetch(path, opts = {}) {
   return fetch(url, {
     ...opts,
     headers: {
-      ...boxnowHeaders(token),
-      ...(opts.headers || {})
-    }
+      ...buildHeaders(token),
+      "Content-Type": "application/json",
+      ...(opts.headers || {}),
+    },
   });
 }
 
@@ -157,8 +155,7 @@ async function boxnowApiFetch(path, opts = {}) {
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 /**
- * ✅ DESTINATIONS from Location API (NO AUTH) -> fixes 401
- * Manual location endpoints :contentReference[oaicite:8]{index=8}
+ * ✅ DESTINATIONS from Location API WITH AUTH (fixes your 401)
  */
 app.get("/api/boxnow/destinations", async (req, res) => {
   try {
@@ -166,10 +163,15 @@ app.get("/api/boxnow/destinations", async (req, res) => {
     const qs = new URLSearchParams(req.query).toString();
     const url = `${base}/destinations${qs ? `?${qs}` : ""}`;
 
-    const r = await fetch(url, { headers: { accept: "application/json" } });
-    const text = await r.text();
+    const token = await authToken();
 
+    const r = await fetch(url, {
+      headers: buildHeaders(token),
+    });
+
+    const text = await r.text();
     if (!r.ok) return res.status(r.status).send(text);
+
     res.type("json").send(text);
   } catch (e) {
     console.error("destinations error:", e);
@@ -178,7 +180,7 @@ app.get("/api/boxnow/destinations", async (req, res) => {
 });
 
 /**
- * Optional: ORIGINS from Location API (NO AUTH)
+ * Optional: ORIGINS from Location API WITH AUTH
  */
 app.get("/api/boxnow/origins", async (req, res) => {
   try {
@@ -186,10 +188,15 @@ app.get("/api/boxnow/origins", async (req, res) => {
     const qs = new URLSearchParams(req.query).toString();
     const url = `${base}/origins${qs ? `?${qs}` : ""}`;
 
-    const r = await fetch(url, { headers: { accept: "application/json" } });
-    const text = await r.text();
+    const token = await authToken();
 
+    const r = await fetch(url, {
+      headers: buildHeaders(token),
+    });
+
+    const text = await r.text();
     if (!r.ok) return res.status(r.status).send(text);
+
     res.type("json").send(text);
   } catch (e) {
     console.error("origins error:", e);
@@ -199,10 +206,6 @@ app.get("/api/boxnow/origins", async (req, res) => {
 
 /**
  * ✅ Delivery Requests - correct schema for BoxNow
- * - origin/destination objects
- * - prepaid/cod only
- * - items are parcels (1 parcel)
- * :contentReference[oaicite:9]{index=9}
  */
 app.post("/api/boxnow/delivery-requests", async (req, res) => {
   try {
@@ -244,8 +247,8 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
           name: customerName || null,
           email: customerEmail || null,
           phone: customerPhoneRaw || null,
-          normalizedPhone: customerPhone || null
-        }
+          normalizedPhone: customerPhone || null,
+        },
       });
     }
 
@@ -260,7 +263,7 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
       order.compartmentSize ?? order.items?.[0]?.compartmentSize ?? 2
     );
 
-    // AnyAPM origin=2 requires valid 1/2/3 :contentReference[oaicite:10]{index=10}
+    // AnyAPM origin=2 requires valid 1/2/3
     if (originLocationId === "2" && ![1, 2, 3].includes(compartmentSize)) {
       return res.status(400).json({ error: "Invalid compartmentSize (must be 1/2/3)" });
     }
@@ -276,14 +279,14 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
         contactName: String(customerName),
         contactEmail: String(customerEmail),
         contactNumber: String(customerPhone),
-        country: "GR"
+        country: "GR",
       },
       destination: {
         locationId: String(destinationLocationId),
         contactName: String(customerName),
         contactEmail: String(customerEmail),
         contactNumber: String(customerPhone),
-        country: "GR"
+        country: "GR",
       },
 
       items: [
@@ -292,16 +295,16 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
           name: String(order.parcelName || "Order"),
           value: invoiceValue,
           weight: normalizeWeightToGrams(totalWeightKg),
-          compartmentSize
-        }
-      ]
+          compartmentSize,
+        },
+      ],
     };
 
     console.log("📦 BoxNow delivery request payload:\n", JSON.stringify(deliveryRequest, null, 2));
 
     const r = await boxnowApiFetch("/api/v1/delivery-requests", {
       method: "POST",
-      body: JSON.stringify(deliveryRequest)
+      body: JSON.stringify(deliveryRequest),
     });
 
     const text = await r.text();
@@ -320,3 +323,4 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
+
