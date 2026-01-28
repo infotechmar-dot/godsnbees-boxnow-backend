@@ -10,62 +10,40 @@ const API = (process.env.BOXNOW_API_URL || '').replace(/\/$/, '');
 const CLIENT_ID = process.env.BOXNOW_CLIENT_ID;
 const CLIENT_SECRET = process.env.BOXNOW_CLIENT_SECRET;
 
-// (προαιρετικό) αν στο δώσανε σαν οδηγία
-const PARTNER_ID = process.env.BOXNOW_PARTNER_ID; // π.χ. "9191"
+// BoxNow instructions you shared:
+// - Warehouse/Origin ID: 2 (stage & production)
+const DEFAULT_WAREHOUSE_LOCATION_ID = '2';
 
-// ✅ BoxNow οδηγία: Warehouse/Origin ID = 2 (stage+prod)
-const DEFAULT_ORIGIN_LOCATION_ID = process.env.BOXNOW_WAREHOUSE_ID || '2';
-
-// Επιλογή υπηρεσίας (από screenshots σου: allowed same-day, next-day)
-const DEFAULT_TYPE_OF_SERVICE = process.env.BOXNOW_TYPE_OF_SERVICE || 'next-day';
+// Allowed values (from your error screenshot): same-day, next-day
+const ALLOWED_SERVICE_TYPES = new Set(['same-day', 'next-day']);
 
 let cachedToken = null;
 let tokenExpiry = null;
 
 const mapPaymentModeToBoxNow = (method) => {
   const normalized = String(method || '').toLowerCase();
-  const prepaid = ['card', 'stripe', 'paypal', 'bank_transfer', 'bank', 'prepaid'];
-  const cod = ['cod', 'cash_on_delivery', 'boxnow_cod', 'pay_on_go', 'pay_on_the_go'];
+  const prepaid = ['card', 'stripe', 'paypal', 'bank_transfer', 'bank transfer', 'prepaid'];
+  const cod = ['cod', 'cash_on_delivery', 'cash on delivery', 'boxnow_cod', 'pay_on_go', 'pay on go'];
   if (cod.includes(normalized)) return 'cod';
   if (prepaid.includes(normalized)) return 'prepaid';
   return 'prepaid';
 };
 
-const toMoney = (n) => {
+function cleanPhoneToDigits(phone) {
+  return String(phone || '').replace(/\D/g, '');
+}
+
+function safeMoney(n) {
   const x = Number(n || 0);
-  return (Number.isFinite(x) ? x : 0).toFixed(2);
-};
-
-const normalizePhone = (raw) => {
-  // BoxNow συνήθως θέλει αριθμό με country code.
-  // Θα προσπαθήσουμε να τον κάνουμε +30XXXXXXXXXX για Ελλάδα αν δεν έχει.
-  let s = String(raw || '').trim();
-  if (!s) return '';
-
-  // κράτα + και ψηφία
-  s = s.replace(/[^\d+]/g, '');
-  // αν ξεκινά με 00 -> +
-  if (s.startsWith('00')) s = '+' + s.slice(2);
-
-  // αν δεν έχει + και είναι 10ψήφιο (ελληνικό κινητό) -> +30
-  const digitsOnly = s.replace(/\D/g, '');
-  if (!s.startsWith('+') && digitsOnly.length === 10) {
-    return `+30${digitsOnly}`;
-  }
-
-  // αν είναι ήδη με 30 μπροστά χωρίς + (π.χ. 3069...) -> +30...
-  if (!s.startsWith('+') && digitsOnly.startsWith('30')) {
-    return `+${digitsOnly}`;
-  }
-
-  // αν έχει + αλλά χωρίς άλλα σκουπίδια
-  if (s.startsWith('+')) return `+${digitsOnly}`;
-
-  return digitsOnly;
-};
+  return Number.isFinite(x) ? x.toFixed(2) : '0.00';
+}
 
 async function authToken() {
   if (cachedToken && tokenExpiry && new Date() < tokenExpiry) return cachedToken;
+
+  if (!API || !CLIENT_ID || !CLIENT_SECRET) {
+    throw new Error('Missing BOXNOW_API_URL / BOXNOW_CLIENT_ID / BOXNOW_CLIENT_SECRET in env');
+  }
 
   const res = await fetch(`${API}/api/v1/auth-sessions`, {
     method: 'POST',
@@ -92,22 +70,21 @@ async function boxnowFetch(path, opts = {}) {
   const token = await authToken();
   const url = `${API}${path.startsWith('/') ? '' : '/'}${path}`;
 
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    ...(opts.headers || {}),
-  };
-
-  // (προαιρετικό) Αν η BoxNow σου έχει πει για Partner header, βάλε το:
-  // Δεν ξέρω αν το θέλει ως header ή body — το αφήνω ασφαλές/προαιρετικό.
-  if (PARTNER_ID) {
-    headers['X-Partner-Id'] = String(PARTNER_ID);
-  }
-
-  return fetch(url, { ...opts, headers });
+  return fetch(url, {
+    ...opts,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      ...(opts.headers || {}),
+    },
+  });
 }
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
+/**
+ * Optional proxy endpoints (keep them if your frontend uses them)
+ */
 app.get('/api/boxnow/origins', async (_req, res) => {
   try {
     const r = await boxnowFetch('/api/v1/origins');
@@ -133,107 +110,128 @@ app.get('/api/boxnow/destinations', async (req, res) => {
   }
 });
 
+/**
+ * ✅ FIXED endpoint for delivery requests
+ *
+ * Accepts BOTH payload styles:
+ * A) Your current frontend (top-level contactEmail/contactName/contactPhone)
+ * B) A normalized payload (customer: {name,email,phone})
+ */
 app.post('/api/boxnow/delivery-requests', async (req, res) => {
   try {
     const order = req.body || {};
 
+    // Accept both shapes
+    const customerName =
+      order.customer?.name ??
+      order.contactName ??
+      `${order.firstName || ''} ${order.lastName || ''}`.trim();
+
+    const customerEmail = order.customer?.email ?? order.contactEmail ?? order.email;
+    const customerPhoneRaw = order.customer?.phone ?? order.contactPhone ?? order.phone;
+    const customerPhone = cleanPhoneToDigits(customerPhoneRaw);
+
+    const destinationLocationId =
+      order.destinationLocationId ??
+      order.destination?.locationId ??
+      order.selectedLockerId ??
+      order.lockerId;
+
+    const orderNumber = String(order.orderNumber || `ORD-${Date.now()}`);
+
+    // invoiceValue: use invoiceValue if exists else fallback to amountToBeCollected/total
+    const invoiceValueNum =
+      Number(order.invoiceValue ?? order.total ?? order.amountToBeCollected ?? 0);
+
     const paymentMode = mapPaymentModeToBoxNow(order.paymentMode);
 
-    // ✅ ΚΑΝΟΝΑΣ:
-    // prepaid -> amountToBeCollected = 0
-    // cod -> amountToBeCollected = invoice
-    const invoiceValueNum = Number(order.invoiceValue || 0);
-    const invoiceValue = toMoney(invoiceValueNum);
-
+    // COD logic
     const amountToBeCollected =
       paymentMode === 'cod'
-        ? toMoney(order.amountToBeCollected ?? invoiceValueNum)
+        ? safeMoney(order.amountToBeCollected ?? invoiceValueNum)
         : '0.00';
 
-    const contactEmail = String(order.contactEmail || '').trim();
-    const contactName = String(order.contactName || '').trim();
-    const contactNumber = normalizePhone(order.contactPhone);
+    // Service type validation (fix P400)
+    const typeOfServiceCandidate = String(order.typeOfService || 'next-day');
+    const typeOfService = ALLOWED_SERVICE_TYPES.has(typeOfServiceCandidate)
+      ? typeOfServiceCandidate
+      : 'next-day';
 
-    // Αυτά σε “σκοτώνουν” με 400 αν λείπουν:
-    if (!contactEmail || !contactName || !contactNumber) {
+    // HARD validation to avoid P406/P400
+    if (!destinationLocationId) {
+      return res.status(400).json({ error: 'Missing destinationLocationId' });
+    }
+    if (!customerName || !customerEmail || !customerPhone) {
       return res.status(400).json({
-        message: 'Missing required contact fields for BoxNow',
-        details: {
-          contactEmail: !!contactEmail,
-          contactName: !!contactName,
-          contactPhone: !!contactNumber,
+        error: 'Missing customer contact fields (name/email/phone)',
+        received: {
+          name: customerName || null,
+          email: customerEmail || null,
+          phone: customerPhoneRaw || null,
+          phoneDigits: customerPhone || null,
         },
       });
     }
 
-    const originLocationId = String(order.originLocationId || DEFAULT_ORIGIN_LOCATION_ID);
-    const destinationLocationId = String(order.destinationLocationId || '');
-
-    if (!destinationLocationId) {
-      return res.status(400).json({ message: 'Missing destinationLocationId (locker id)' });
-    }
-
-    // Items
-    const items = (order.items || []).map((item) => ({
-      id: String(item.id ?? ''),
-      name: String(item.name ?? ''),
-      // κάποια schemas θέλουν value με 2 decimals
-      value: toMoney(item.value ?? item.price ?? 0),
-      // βάρος σε αριθμό
-      weight:
+    // Items mapping (keep quantity/weight/value safe)
+    const items = (order.items || []).map((item) => {
+      const quantity = Number(item.quantity ?? 1);
+      const weight =
         typeof item.weight === 'string'
           ? Number(item.weight.replace(',', '.'))
-          : Number(item.weight || 0),
-      // αν το schema το δέχεται, κράτα quantity
-      quantity: Number(item.quantity || 1),
-    }));
+          : Number(item.weight ?? item.weightKg ?? 0.3);
+
+      const price = Number(item.price ?? item.value ?? 0);
+      return {
+        name: String(item.name ?? ''),
+        quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : 1,
+        weight: Number.isFinite(weight) && weight > 0 ? weight : 0.3,
+        value: safeMoney(price),
+      };
+    });
 
     const requestBody = {
-      typeOfService: DEFAULT_TYPE_OF_SERVICE, // ✅ next-day (ή same-day)
-      orderNumber: String(order.orderNumber || `ORD-${Date.now()}`),
-
-      invoiceValue,
-      paymentMode, // prepaid | cod
+      typeOfService,
+      orderNumber,
+      invoiceValue: safeMoney(invoiceValueNum),
+      paymentMode,
       amountToBeCollected,
-
       allowReturn: false,
 
-      // ✅ Οδηγία BoxNow: warehouse/origin id = 2
-      origin: { locationId: originLocationId },
+      // ✅ Per BoxNow instruction: Warehouse/Origin ID = 2
+      origin: { locationId: DEFAULT_WAREHOUSE_LOCATION_ID },
 
-      // ✅ Εδώ ήταν το βασικό πρόβλημα πριν: contact fields πρέπει να είναι στο destination
+      // ✅ Critical fix: contact fields must be inside destination
       destination: {
-        locationId: destinationLocationId,
-        contactEmail,
-        contactName,
-        contactNumber,
+        locationId: String(destinationLocationId),
+        contactName: String(customerName),
+        contactEmail: String(customerEmail),
+        contactNumber: String(customerPhone),
       },
 
       items,
     };
 
-    // (προαιρετικό) αν το API θέλει partnerId στο body (κάποιες εγκαταστάσεις το θέλουν)
-    if (PARTNER_ID) requestBody.partnerId = Number(PARTNER_ID);
+    console.log('📦 BoxNow delivery request payload:\n', JSON.stringify(requestBody, null, 2));
 
     const r = await boxnowFetch('/api/v1/delivery-requests', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(requestBody),
     });
 
     const text = await r.text();
+
     if (!r.ok) {
-      // γύρνα πίσω ό,τι λέει το BoxNow για να το βλέπεις καθαρά στο frontend
+      console.error('❌ BoxNow API error:', r.status, text);
       return res.status(r.status).send(text);
     }
 
     res.type('json').send(text);
   } catch (e) {
     console.error('delivery-requests error:', e);
-    res.status(502).json({ message: 'BoxNow delivery request error' });
+    res.status(502).json({ message: 'BoxNow delivery request error', details: String(e?.message || e) });
   }
 });
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
-
