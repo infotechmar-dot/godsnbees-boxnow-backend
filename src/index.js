@@ -9,21 +9,60 @@ app.use(express.json({ limit: '1mb' }));
 const API = (process.env.BOXNOW_API_URL || '').replace(/\/$/, '');
 const CLIENT_ID = process.env.BOXNOW_CLIENT_ID;
 const CLIENT_SECRET = process.env.BOXNOW_CLIENT_SECRET;
-const PARTNER_ID = process.env.BOXNOW_PARTNER_ID; // STAGE: 9191
-const WAREHOUSE_ID = String(process.env.BOXNOW_WAREHOUSE_ID || '2'); // ✅ BoxNow says: always 2
-const FORCE_PREPAID_STAGE =
-  String(process.env.BOXNOW_FORCE_PREPAID_STAGE || 'true').toLowerCase() === 'true'; // ✅ STAGE: true
+
+// (προαιρετικό) αν στο δώσανε σαν οδηγία
+const PARTNER_ID = process.env.BOXNOW_PARTNER_ID; // π.χ. "9191"
+
+// ✅ BoxNow οδηγία: Warehouse/Origin ID = 2 (stage+prod)
+const DEFAULT_ORIGIN_LOCATION_ID = process.env.BOXNOW_WAREHOUSE_ID || '2';
+
+// Επιλογή υπηρεσίας (από screenshots σου: allowed same-day, next-day)
+const DEFAULT_TYPE_OF_SERVICE = process.env.BOXNOW_TYPE_OF_SERVICE || 'next-day';
 
 let cachedToken = null;
 let tokenExpiry = null;
 
-const normalizePhone = (value) => String(value || '').replace(/\D/g, '');
+const mapPaymentModeToBoxNow = (method) => {
+  const normalized = String(method || '').toLowerCase();
+  const prepaid = ['card', 'stripe', 'paypal', 'bank_transfer', 'bank', 'prepaid'];
+  const cod = ['cod', 'cash_on_delivery', 'boxnow_cod', 'pay_on_go', 'pay_on_the_go'];
+  if (cod.includes(normalized)) return 'cod';
+  if (prepaid.includes(normalized)) return 'prepaid';
+  return 'prepaid';
+};
 
-const toLatin = (str = '') =>
-  String(str || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^\x00-\x7F]/g, '');
+const toMoney = (n) => {
+  const x = Number(n || 0);
+  return (Number.isFinite(x) ? x : 0).toFixed(2);
+};
+
+const normalizePhone = (raw) => {
+  // BoxNow συνήθως θέλει αριθμό με country code.
+  // Θα προσπαθήσουμε να τον κάνουμε +30XXXXXXXXXX για Ελλάδα αν δεν έχει.
+  let s = String(raw || '').trim();
+  if (!s) return '';
+
+  // κράτα + και ψηφία
+  s = s.replace(/[^\d+]/g, '');
+  // αν ξεκινά με 00 -> +
+  if (s.startsWith('00')) s = '+' + s.slice(2);
+
+  // αν δεν έχει + και είναι 10ψήφιο (ελληνικό κινητό) -> +30
+  const digitsOnly = s.replace(/\D/g, '');
+  if (!s.startsWith('+') && digitsOnly.length === 10) {
+    return `+30${digitsOnly}`;
+  }
+
+  // αν είναι ήδη με 30 μπροστά χωρίς + (π.χ. 3069...) -> +30...
+  if (!s.startsWith('+') && digitsOnly.startsWith('30')) {
+    return `+${digitsOnly}`;
+  }
+
+  // αν έχει + αλλά χωρίς άλλα σκουπίδια
+  if (s.startsWith('+')) return `+${digitsOnly}`;
+
+  return digitsOnly;
+};
 
 async function authToken() {
   if (cachedToken && tokenExpiry && new Date() < tokenExpiry) return cachedToken;
@@ -52,13 +91,19 @@ async function authToken() {
 async function boxnowFetch(path, opts = {}) {
   const token = await authToken();
   const url = `${API}${path.startsWith('/') ? '' : '/'}${path}`;
-  return fetch(url, {
-    ...opts,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      ...(opts.headers || {}),
-    },
-  });
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    ...(opts.headers || {}),
+  };
+
+  // (προαιρετικό) Αν η BoxNow σου έχει πει για Partner header, βάλε το:
+  // Δεν ξέρω αν το θέλει ως header ή body — το αφήνω ασφαλές/προαιρετικό.
+  if (PARTNER_ID) {
+    headers['X-Partner-Id'] = String(PARTNER_ID);
+  }
+
+  return fetch(url, { ...opts, headers });
 }
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
@@ -90,61 +135,85 @@ app.get('/api/boxnow/destinations', async (req, res) => {
 
 app.post('/api/boxnow/delivery-requests', async (req, res) => {
   try {
-    if (!PARTNER_ID) return res.status(500).json({ message: 'BOXNOW_PARTNER_ID missing' });
-    if (!WAREHOUSE_ID) return res.status(500).json({ message: 'BOXNOW_WAREHOUSE_ID missing' });
-
     const order = req.body || {};
-    const destinationId = String(order.destinationLocationId || '');
 
-    if (!destinationId) return res.status(400).json({ message: 'Missing destinationLocationId (Locker ID)' });
-    if (WAREHOUSE_ID === destinationId) {
-      return res.status(400).json({ message: 'Warehouse ID and Locker ID must be different (2 ≠ 4)' });
+    const paymentMode = mapPaymentModeToBoxNow(order.paymentMode);
+
+    // ✅ ΚΑΝΟΝΑΣ:
+    // prepaid -> amountToBeCollected = 0
+    // cod -> amountToBeCollected = invoice
+    const invoiceValueNum = Number(order.invoiceValue || 0);
+    const invoiceValue = toMoney(invoiceValueNum);
+
+    const amountToBeCollected =
+      paymentMode === 'cod'
+        ? toMoney(order.amountToBeCollected ?? invoiceValueNum)
+        : '0.00';
+
+    const contactEmail = String(order.contactEmail || '').trim();
+    const contactName = String(order.contactName || '').trim();
+    const contactNumber = normalizePhone(order.contactPhone);
+
+    // Αυτά σε “σκοτώνουν” με 400 αν λείπουν:
+    if (!contactEmail || !contactName || !contactNumber) {
+      return res.status(400).json({
+        message: 'Missing required contact fields for BoxNow',
+        details: {
+          contactEmail: !!contactEmail,
+          contactName: !!contactName,
+          contactPhone: !!contactNumber,
+        },
+      });
     }
 
-    const invoiceValue = Number(order.invoiceValue || 0);
+    const originLocationId = String(order.originLocationId || DEFAULT_ORIGIN_LOCATION_ID);
+    const destinationLocationId = String(order.destinationLocationId || '');
 
-    // ✅ STAGE: only prepaid to avoid P405
-    const paymentMode = FORCE_PREPAID_STAGE ? 'prepaid' : 'prepaid';
-    const amountToBeCollected = '0.00';
+    if (!destinationLocationId) {
+      return res.status(400).json({ message: 'Missing destinationLocationId (locker id)' });
+    }
+
+    // Items
+    const items = (order.items || []).map((item) => ({
+      id: String(item.id ?? ''),
+      name: String(item.name ?? ''),
+      // κάποια schemas θέλουν value με 2 decimals
+      value: toMoney(item.value ?? item.price ?? 0),
+      // βάρος σε αριθμό
+      weight:
+        typeof item.weight === 'string'
+          ? Number(item.weight.replace(',', '.'))
+          : Number(item.weight || 0),
+      // αν το schema το δέχεται, κράτα quantity
+      quantity: Number(item.quantity || 1),
+    }));
 
     const requestBody = {
-      partnerId: String(PARTNER_ID),
+      typeOfService: DEFAULT_TYPE_OF_SERVICE, // ✅ next-day (ή same-day)
+      orderNumber: String(order.orderNumber || `ORD-${Date.now()}`),
 
-      // ✅ BoxNow allowed values: same-day / next-day
-      typeOfService: 'next-day',
-
-      orderNumber: String(order.orderNumber),
-      invoiceValue: invoiceValue.toFixed(2),
-      paymentMode,
+      invoiceValue,
+      paymentMode, // prepaid | cod
       amountToBeCollected,
+
       allowReturn: false,
 
-      // ✅ BoxNow instruction: Warehouse ID = 2
-      origin: { locationId: String(WAREHOUSE_ID) },
+      // ✅ Οδηγία BoxNow: warehouse/origin id = 2
+      origin: { locationId: originLocationId },
 
-      // ✅ BoxNow instruction: test locker id = 4
+      // ✅ Εδώ ήταν το βασικό πρόβλημα πριν: contact fields πρέπει να είναι στο destination
       destination: {
-        locationId: destinationId,
-        contactEmail: String(order.contactEmail || ''),
-        contactName: toLatin(order.contactName || ''),
-        contactNumber: normalizePhone(order.contactPhone || ''),
+        locationId: destinationLocationId,
+        contactEmail,
+        contactName,
+        contactNumber,
       },
 
-      items: (order.items || []).map((item) => ({
-        id: String(item.id ?? ''),
-        name: String(item.name ?? ''),
-        value: String(Number(item.value ?? item.price ?? 0).toFixed(2)),
-        weight: Math.max(
-          0.1,
-          typeof item.weight === 'string'
-            ? Number(item.weight.replace(',', '.'))
-            : Number(item.weight || 0)
-        ),
-      })),
+      items,
     };
 
-    if (!requestBody.destination.contactEmail) return res.status(400).json({ message: 'Missing destination.contactEmail' });
-    if (!requestBody.destination.contactNumber) return res.status(400).json({ message: 'Missing destination.contactNumber' });
+    // (προαιρετικό) αν το API θέλει partnerId στο body (κάποιες εγκαταστάσεις το θέλουν)
+    if (PARTNER_ID) requestBody.partnerId = Number(PARTNER_ID);
 
     const r = await boxnowFetch('/api/v1/delivery-requests', {
       method: 'POST',
@@ -153,7 +222,11 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
     });
 
     const text = await r.text();
-    if (!r.ok) return res.status(r.status).send(text);
+    if (!r.ok) {
+      // γύρνα πίσω ό,τι λέει το BoxNow για να το βλέπεις καθαρά στο frontend
+      return res.status(r.status).send(text);
+    }
+
     res.type('json').send(text);
   } catch (e) {
     console.error('delivery-requests error:', e);
@@ -163,7 +236,4 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
-
-
-
 
