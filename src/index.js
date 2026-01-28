@@ -9,8 +9,10 @@ app.use(express.json({ limit: '1mb' }));
 const API = (process.env.BOXNOW_API_URL || '').replace(/\/$/, '');
 const CLIENT_ID = process.env.BOXNOW_CLIENT_ID;
 const CLIENT_SECRET = process.env.BOXNOW_CLIENT_SECRET;
-const PARTNER_ID = process.env.BOXNOW_PARTNER_ID;      // STAGE: 9191 (PROD: different)
-const WAREHOUSE_ID = String(process.env.BOXNOW_WAREHOUSE_ID || '2'); // ✅ BoxNow: Warehouse ID = 2 (STAGE & PROD)
+const PARTNER_ID = process.env.BOXNOW_PARTNER_ID; // STAGE: 9191
+const WAREHOUSE_ID = String(process.env.BOXNOW_WAREHOUSE_ID || '2'); // ✅ BoxNow says: always 2
+const FORCE_PREPAID_STAGE =
+  String(process.env.BOXNOW_FORCE_PREPAID_STAGE || 'true').toLowerCase() === 'true'; // ✅ STAGE: true
 
 let cachedToken = null;
 let tokenExpiry = null;
@@ -22,19 +24,6 @@ const toLatin = (str = '') =>
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^\x00-\x7F]/g, '');
-
-// ✅ STAGE SAFE: force prepaid (BoxNow stage often doesn't allow COD/Pay-on-Go)
-const FORCE_PREPAID_STAGE =
-  String(process.env.BOXNOW_FORCE_PREPAID_STAGE || 'true').toLowerCase() === 'true';
-
-const mapPaymentModeToBoxNow = (method) => {
-  const normalized = String(method || '').toLowerCase();
-  const prepaid = ['card', 'stripe', 'paypal', 'bank_transfer', 'prepaid'];
-  const cod = ['cod', 'cash_on_delivery', 'boxnow_cod', 'pay_on_go'];
-  if (cod.includes(normalized)) return 'cod';
-  if (prepaid.includes(normalized)) return 'prepaid';
-  return 'prepaid';
-};
 
 async function authToken() {
   if (cachedToken && tokenExpiry && new Date() < tokenExpiry) return cachedToken;
@@ -101,34 +90,27 @@ app.get('/api/boxnow/destinations', async (req, res) => {
 
 app.post('/api/boxnow/delivery-requests', async (req, res) => {
   try {
-    if (!PARTNER_ID) {
-      return res.status(500).json({ message: 'BOXNOW_PARTNER_ID is not configured on the server' });
-    }
-    if (!WAREHOUSE_ID) {
-      return res.status(500).json({ message: 'BOXNOW_WAREHOUSE_ID is not configured on the server' });
-    }
+    if (!PARTNER_ID) return res.status(500).json({ message: 'BOXNOW_PARTNER_ID missing' });
+    if (!WAREHOUSE_ID) return res.status(500).json({ message: 'BOXNOW_WAREHOUSE_ID missing' });
 
     const order = req.body || {};
     const destinationId = String(order.destinationLocationId || '');
 
-    if (!destinationId) {
-      return res.status(400).json({ message: 'Missing destinationLocationId (Locker ID)' });
-    }
+    if (!destinationId) return res.status(400).json({ message: 'Missing destinationLocationId (Locker ID)' });
     if (WAREHOUSE_ID === destinationId) {
       return res.status(400).json({ message: 'Warehouse ID and Locker ID must be different (2 ≠ 4)' });
     }
 
     const invoiceValue = Number(order.invoiceValue || 0);
 
-    // ✅ STAGE workaround: always prepaid + 0.00 collected
-    let paymentMode = FORCE_PREPAID_STAGE ? 'prepaid' : mapPaymentModeToBoxNow(order.paymentMode);
-    const amountToBeCollected =
-      paymentMode === 'cod' ? Number(order.amountToBeCollected ?? invoiceValue).toFixed(2) : '0.00';
+    // ✅ STAGE: only prepaid to avoid P405
+    const paymentMode = FORCE_PREPAID_STAGE ? 'prepaid' : 'prepaid';
+    const amountToBeCollected = '0.00';
 
     const requestBody = {
       partnerId: String(PARTNER_ID),
 
-      // ✅ allowed values per BoxNow: "same-day" or "next-day"
+      // ✅ BoxNow allowed values: same-day / next-day
       typeOfService: 'next-day',
 
       orderNumber: String(order.orderNumber),
@@ -137,10 +119,10 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
       amountToBeCollected,
       allowReturn: false,
 
-      // ✅ per BoxNow instructions: Warehouse ID = 2
+      // ✅ BoxNow instruction: Warehouse ID = 2
       origin: { locationId: String(WAREHOUSE_ID) },
 
-      // ✅ per BoxNow instructions: test locker id = 4
+      // ✅ BoxNow instruction: test locker id = 4
       destination: {
         locationId: destinationId,
         contactEmail: String(order.contactEmail || ''),
@@ -161,12 +143,8 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
       })),
     };
 
-    if (!requestBody.destination.contactEmail) {
-      return res.status(400).json({ message: 'Missing destination.contactEmail' });
-    }
-    if (!requestBody.destination.contactNumber) {
-      return res.status(400).json({ message: 'Missing destination.contactNumber' });
-    }
+    if (!requestBody.destination.contactEmail) return res.status(400).json({ message: 'Missing destination.contactEmail' });
+    if (!requestBody.destination.contactNumber) return res.status(400).json({ message: 'Missing destination.contactNumber' });
 
     const r = await boxnowFetch('/api/v1/delivery-requests', {
       method: 'POST',
@@ -185,7 +163,6 @@ app.post('/api/boxnow/delivery-requests', async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
-
 
 
 
