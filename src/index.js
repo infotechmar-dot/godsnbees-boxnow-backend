@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import nodemailer from "nodemailer";
 
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
@@ -19,6 +20,27 @@ const FORCE_PREPAID = String(process.env.BOXNOW_FORCE_PREPAID_ST || "false").toL
 
 // optional override
 const BOXNOW_ENV = (process.env.BOXNOW_ENV || "").toLowerCase(); // stage | production
+
+// -------------------- MAIL ENV --------------------
+const MAIL_HOST = (process.env.MAIL_HOST || "").trim();
+const MAIL_PORT = Number(process.env.MAIL_PORT || 465);
+const MAIL_SECURE = String(process.env.MAIL_SECURE || "true").toLowerCase() === "true";
+const MAIL_USER = (process.env.MAIL_USER || "").trim(); // e.g. info@godsnbees.com
+const MAIL_PASS = process.env.MAIL_PASS || "";
+const VOUCHER_EMAIL_TO = (process.env.VOUCHER_EMAIL_TO || MAIL_USER).trim(); // comma separated allowed
+
+function mailEnabled() {
+  return !!(MAIL_HOST && MAIL_PORT && MAIL_USER && MAIL_PASS && VOUCHER_EMAIL_TO);
+}
+
+function makeMailer() {
+  return nodemailer.createTransport({
+    host: MAIL_HOST,
+    port: MAIL_PORT,
+    secure: MAIL_SECURE,
+    auth: { user: MAIL_USER, pass: MAIL_PASS },
+  });
+}
 
 // -------------------- HELPERS --------------------
 function stripTrailingSlash(s) {
@@ -43,7 +65,6 @@ function ensureEnv() {
 // Location API base (stage/prod)
 function locationBase() {
   const inferred = BOXNOW_ENV || (API_BASE.includes("production") ? "production" : "stage");
-
   return inferred === "production"
     ? "https://locationapi-production.boxnow.gr/api/v1"
     : "https://locationapi-stage.boxnow.gr/api/v1";
@@ -59,9 +80,7 @@ function safeMoney(n) {
 function normalizePhone(phoneRaw) {
   let p = String(phoneRaw || "").trim().replace(/\s+/g, "");
   if (!p) return "";
-
   if (p.startsWith("+")) return `+${p.slice(1).replace(/\D/g, "")}`;
-
   p = p.replace(/\D/g, "");
   if (p.startsWith("69")) return `+30${p}`;
   if (p.startsWith("30")) return `+${p}`;
@@ -73,7 +92,7 @@ function normalizePhone(phoneRaw) {
 function mapPaymentModeToBoxNow(method) {
   const normalized = String(method || "").toLowerCase();
   const prepaid = ["card", "stripe", "paypal", "bank_transfer", "bank transfer", "prepaid"];
-  const cod = ["cod", "cash_on_delivery", "cash on delivery", "boxnow_cod", "pay_on_go", "pay on go"];
+  const cod = ["cod", "cash_on_delivery", "cash on delivery", "boxnow_cod", "pay_on_go", "pay on go", "boxnow_pay_on_the_go"];
   if (cod.includes(normalized)) return "cod";
   if (prepaid.includes(normalized)) return "prepaid";
   return "prepaid";
@@ -109,8 +128,8 @@ async function authToken() {
     body: JSON.stringify({
       grant_type: "client_credentials",
       client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET
-    })
+      client_secret: CLIENT_SECRET,
+    }),
   });
 
   const text = await res.text();
@@ -130,7 +149,7 @@ async function authToken() {
 function buildHeaders(token) {
   const h = {
     Authorization: `Bearer ${token}`,
-    accept: "application/json"
+    accept: "application/json",
   };
   if (PARTNER_ID) h["X-PartnerID"] = PARTNER_ID;
   return h;
@@ -144,9 +163,54 @@ async function boxnowApiFetch(path, opts = {}) {
     headers: {
       ...buildHeaders(token),
       "Content-Type": "application/json",
-      ...(opts.headers || {})
-    }
+      ...(opts.headers || {}),
+    },
   });
+}
+
+async function fetchBoxNowLabelPDF(orderNumber) {
+  const token = await authToken();
+  const url = `${API_BASE}/api/v1/delivery-requests/${encodeURIComponent(orderNumber)}/label.pdf`;
+
+  const r = await fetch(url, {
+    method: "GET",
+    headers: {
+      ...buildHeaders(token),
+      accept: "application/pdf",
+    },
+  });
+
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`Label fetch failed (${r.status}): ${txt.slice(0, 200)}`);
+  }
+
+  return Buffer.from(await r.arrayBuffer());
+}
+
+async function emailVoucherPdf({ orderNumber, pdfBuffer }) {
+  if (!mailEnabled()) {
+    console.warn("✉️ Mail not configured (MAIL_* / VOUCHER_EMAIL_TO missing). Skipping voucher email.");
+    return { sent: false, reason: "mail_not_configured" };
+  }
+
+  const transporter = makeMailer();
+  const toList = VOUCHER_EMAIL_TO.split(",").map((s) => s.trim()).filter(Boolean);
+
+  await transporter.sendMail({
+    from: `"Gods n Bees" <${MAIL_USER}>`,
+    to: toList,
+    subject: `BOXNOW Voucher – ${orderNumber}`,
+    text: `Επισυνάπτεται το BoxNow voucher (PDF) για την αποστολή ${orderNumber}.`,
+    attachments: [
+      {
+        filename: `BOXNOW-${orderNumber}.pdf`,
+        content: pdfBuffer,
+      },
+    ],
+  });
+
+  return { sent: true, to: toList };
 }
 
 // -------------------- ROUTES --------------------
@@ -198,6 +262,7 @@ app.get("/api/boxnow/origins", async (req, res) => {
 
 /**
  * ✅ Delivery Requests - creates shipment
+ * Also: auto-fetch label PDF and email it (non-fatal)
  */
 app.post("/api/boxnow/delivery-requests", async (req, res) => {
   try {
@@ -239,8 +304,8 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
           name: customerName || null,
           email: customerEmail || null,
           phone: customerPhoneRaw || null,
-          normalizedPhone: customerPhone || null
-        }
+          normalizedPhone: customerPhone || null,
+        },
       });
     }
 
@@ -268,14 +333,14 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
         contactName: String(customerName),
         contactEmail: String(customerEmail),
         contactNumber: String(customerPhone),
-        country: "GR"
+        country: "GR",
       },
       destination: {
         locationId: String(destinationLocationId),
         contactName: String(customerName),
         contactEmail: String(customerEmail),
         contactNumber: String(customerPhone),
-        country: "GR"
+        country: "GR",
       },
       items: [
         {
@@ -283,16 +348,16 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
           name: String(order.parcelName || "Order"),
           value: invoiceValue,
           weight: normalizeWeightToGrams(totalWeightKg),
-          compartmentSize
-        }
-      ]
+          compartmentSize,
+        },
+      ],
     };
 
     console.log("📦 BoxNow delivery request payload:\n", JSON.stringify(deliveryRequest, null, 2));
 
     const r = await boxnowApiFetch("/api/v1/delivery-requests", {
       method: "POST",
-      body: JSON.stringify(deliveryRequest)
+      body: JSON.stringify(deliveryRequest),
     });
 
     const text = await r.text();
@@ -302,7 +367,34 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
       return res.status(r.status).send(text);
     }
 
-    res.type("json").send(text);
+    // Parse BoxNow response safely
+    let parsed = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = null;
+    }
+
+    // ✅ Auto-fetch label + email (non-fatal)
+    (async () => {
+      try {
+        const pdf = await fetchBoxNowLabelPDF(orderNumber);
+        const mailResult = await emailVoucherPdf({ orderNumber, pdfBuffer: pdf });
+        console.log("✉️ Voucher email result:", mailResult);
+      } catch (err) {
+        console.error("✉️ Voucher auto-email failed:", err?.message || err);
+      }
+    })();
+
+    // ✅ Always return structured json to frontend
+    return res.json({
+      boxnowOrderNumber: orderNumber,
+      boxnowResponse: parsed ?? text,
+      voucher: {
+        pdfUrl: `/api/boxnow/labels/order/${encodeURIComponent(orderNumber)}`,
+        emailedTo: mailEnabled() ? VOUCHER_EMAIL_TO : null,
+      },
+    });
   } catch (e) {
     console.error("delivery-requests error:", e);
     res.status(502).json({ message: "BoxNow delivery request error", details: String(e?.message || e) });
@@ -325,8 +417,8 @@ app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
       method: "GET",
       headers: {
         ...buildHeaders(token),
-        accept: "application/pdf"
-      }
+        accept: "application/pdf",
+      },
     });
 
     if (!r.ok) {
@@ -361,8 +453,8 @@ app.get("/api/boxnow/labels/parcel/:parcelId", async (req, res) => {
       method: "GET",
       headers: {
         ...buildHeaders(token),
-        accept: "application/pdf"
-      }
+        accept: "application/pdf",
+      },
     });
 
     if (!r.ok) {
@@ -384,4 +476,3 @@ app.get("/api/boxnow/labels/parcel/:parcelId", async (req, res) => {
 // ✅ ALWAYS last
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
-
