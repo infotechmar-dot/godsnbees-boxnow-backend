@@ -13,33 +13,36 @@ const CLIENT_ID = process.env.BOXNOW_CLIENT_ID;
 const CLIENT_SECRET = process.env.BOXNOW_CLIENT_SECRET;
 
 const PARTNER_ID = (process.env.BOXNOW_PARTNER_ID || "").trim();
-const DEFAULT_ORIGIN_LOCATION_ID = String(process.env.BOXNOW_WAREHOUSE_ID || "2"); // AnyAPM=2
-
+const DEFAULT_ORIGIN_LOCATION_ID = String(process.env.BOXNOW_WAREHOUSE_ID || "2"); // per instruction: 2 (Any-APM)
 const ALLOW_COD = String(process.env.BOXNOW_ALLOW_COD || "false").toLowerCase() === "true";
 const FORCE_PREPAID = String(process.env.BOXNOW_FORCE_PREPAID_ST || "false").toLowerCase() === "true";
-
-// optional override
 const BOXNOW_ENV = (process.env.BOXNOW_ENV || "").toLowerCase(); // stage | production
 
 // -------------------- MAIL ENV --------------------
-const MAIL_HOST = (process.env.MAIL_HOST || "").trim();
-const MAIL_PORT = Number(process.env.MAIL_PORT || 465);
-const MAIL_SECURE = String(process.env.MAIL_SECURE || "true").toLowerCase() === "true";
-const MAIL_USER = (process.env.MAIL_USER || "").trim(); // e.g. info@godsnbees.com
+const MAIL_HOST = (process.env.MAIL_HOST || "").trim(); // Titan: smtp.titan.email
+const MAIL_PORT = Number(process.env.MAIL_PORT || 465); // Titan SSL: 465
+const MAIL_SECURE = String(process.env.MAIL_SECURE || "true").toLowerCase() === "true"; // Titan SSL: true
+const MAIL_USER = (process.env.MAIL_USER || "").trim(); // info@godsnbees.com
 const MAIL_PASS = process.env.MAIL_PASS || "";
-const VOUCHER_EMAIL_TO = (process.env.VOUCHER_EMAIL_TO || MAIL_USER).trim(); // comma separated allowed
+const VOUCHER_EMAIL_TO = (process.env.VOUCHER_EMAIL_TO || MAIL_USER).trim(); // comma-separated allowed
 
 function mailEnabled() {
   return !!(MAIL_HOST && MAIL_PORT && MAIL_USER && MAIL_PASS && VOUCHER_EMAIL_TO);
 }
 
-function makeMailer() {
-  return nodemailer.createTransport({
+let mailer = null;
+function getMailer() {
+  if (!mailEnabled()) return null;
+  if (mailer) return mailer;
+
+  mailer = nodemailer.createTransport({
     host: MAIL_HOST,
     port: MAIL_PORT,
     secure: MAIL_SECURE,
     auth: { user: MAIL_USER, pass: MAIL_PASS },
   });
+
+  return mailer;
 }
 
 // -------------------- HELPERS --------------------
@@ -47,7 +50,6 @@ function stripTrailingSlash(s) {
   return String(s || "").replace(/\/+$/, "");
 }
 
-// normalize to API BASE without /api/v1 at the end
 function normalizeApiBase(raw) {
   const x = stripTrailingSlash(raw);
   if (!x) return "";
@@ -62,7 +64,6 @@ function ensureEnv() {
   }
 }
 
-// Location API base (stage/prod)
 function locationBase() {
   const inferred = BOXNOW_ENV || (API_BASE.includes("production") ? "production" : "stage");
   return inferred === "production"
@@ -70,25 +71,24 @@ function locationBase() {
     : "https://locationapi-stage.boxnow.gr/api/v1";
 }
 
-// Money
 function safeMoney(n) {
   const x = Number(n || 0);
   return Number.isFinite(x) ? x.toFixed(2) : "0.00";
 }
 
-// BoxNow wants international phone format e.g. +30...
 function normalizePhone(phoneRaw) {
   let p = String(phoneRaw || "").trim().replace(/\s+/g, "");
   if (!p) return "";
+
   if (p.startsWith("+")) return `+${p.slice(1).replace(/\D/g, "")}`;
+
   p = p.replace(/\D/g, "");
-  if (p.startsWith("69")) return `+30${p}`;
+  if (p.startsWith("69")) return `+30${p}`; // Greek mobile
   if (p.startsWith("30")) return `+${p}`;
-  if (p.length === 10) return `+30${p}`;
+  if (p.length === 10) return `+30${p}`; // Greek 10-digit
   return `+${p}`;
 }
 
-// only allowed: prepaid | cod
 function mapPaymentModeToBoxNow(method) {
   const normalized = String(method || "").toLowerCase();
   const prepaid = ["card", "stripe", "paypal", "bank_transfer", "bank transfer", "prepaid"];
@@ -98,18 +98,19 @@ function mapPaymentModeToBoxNow(method) {
   return "prepaid";
 }
 
-function normalizeCompartmentSize(x) {
-  const n = Number(x);
-  if ([1, 2, 3].includes(n)) return n;
-  return 2;
+// Accept weight in kg (number or string like "0,75")
+function parseKg(x) {
+  if (x === null || x === undefined) return 0;
+  const s = String(x).trim().replace(",", ".");
+  const n = Number(s);
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-// safest: grams
-function normalizeWeightToGrams(w) {
-  const n = Number(w);
+// Convert kg -> grams (BoxNow expects grams in item.weight)
+function kgToGrams(kg) {
+  const n = Number(kg);
   if (!Number.isFinite(n) || n <= 0) return 0;
-  if (n <= 50) return Math.round(n * 1000); // kg -> grams
-  return Math.round(n);
+  return Math.round(n * 1000);
 }
 
 // -------------------- TOKEN CACHE --------------------
@@ -189,12 +190,12 @@ async function fetchBoxNowLabelPDF(orderNumber) {
 }
 
 async function emailVoucherPdf({ orderNumber, pdfBuffer }) {
-  if (!mailEnabled()) {
-    console.warn("✉️ Mail not configured (MAIL_* / VOUCHER_EMAIL_TO missing). Skipping voucher email.");
+  const transporter = getMailer();
+  if (!transporter) {
+    console.warn("✉️ Mail not configured. Skipping voucher email.");
     return { sent: false, reason: "mail_not_configured" };
   }
 
-  const transporter = makeMailer();
   const toList = VOUCHER_EMAIL_TO.split(",").map((s) => s.trim()).filter(Boolean);
 
   await transporter.sendMail({
@@ -261,8 +262,10 @@ app.get("/api/boxnow/origins", async (req, res) => {
 });
 
 /**
- * ✅ Delivery Requests - creates shipment
- * Also: auto-fetch label PDF and email it (non-fatal)
+ * ✅ Delivery Requests
+ * - Enforces weight rules (<=5kg / <=12kg / >12kg reject)
+ * - Sets compartmentSize from rules (backend authoritative)
+ * - Auto-fetches voucher PDF & emails it (non-fatal)
  */
 app.post("/api/boxnow/delivery-requests", async (req, res) => {
   try {
@@ -309,16 +312,36 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
       });
     }
 
+    // -------------------- WEIGHT RULES (authoritative) --------------------
+    // Prefer explicit total weight if provided, else sum items.
     const totalWeightKg =
-      Number(order.weightKg ?? order.weight ?? 0) ||
+      parseKg(order.weightKg ?? order.weight ?? 0) ||
       (Array.isArray(order.items)
-        ? order.items.reduce((sum, it) => sum + Number(it.weight ?? it.weightKg ?? 0), 0)
+        ? order.items.reduce((sum, it) => sum + parseKg(it.weightKg ?? it.weight ?? 0) * (Number(it.quantity || 1) || 1), 0)
         : 0);
 
-    const compartmentSize = normalizeCompartmentSize(
-      order.compartmentSize ?? order.items?.[0]?.compartmentSize ?? 2
-    );
+    if (!Number.isFinite(totalWeightKg) || totalWeightKg <= 0) {
+      return res.status(400).json({
+        error: "MISSING_WEIGHT",
+        message: "Total weight is missing/invalid. Ensure products have weight.",
+      });
+    }
 
+    // Reject >12kg
+    if (totalWeightKg > 12) {
+      return res.status(400).json({
+        error: "BOXNOW_MAX_WEIGHT_EXCEEDED",
+        message: "BOX NOW supports up to 12kg. Please split the order or choose another method.",
+        maxKg: 12,
+        receivedKg: Number(totalWeightKg.toFixed(3)),
+      });
+    }
+
+    // Compartment rules:
+    // <=5kg => Medium (2), >5kg<=12kg => Large (3)
+    const compartmentSize = totalWeightKg <= 5 ? 2 : 3;
+
+    // Any-APM origin=2 requires 1/2/3 (we always set 2 or 3)
     if (originLocationId === "2" && ![1, 2, 3].includes(compartmentSize)) {
       return res.status(400).json({ error: "Invalid compartmentSize (must be 1/2/3)" });
     }
@@ -347,7 +370,7 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
           id: "1",
           name: String(order.parcelName || "Order"),
           value: invoiceValue,
-          weight: normalizeWeightToGrams(totalWeightKg),
+          weight: kgToGrams(totalWeightKg),
           compartmentSize,
         },
       ],
@@ -367,7 +390,7 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
       return res.status(r.status).send(text);
     }
 
-    // Parse BoxNow response safely
+    // Parse BoxNow response safely (keep the raw too)
     let parsed = null;
     try {
       parsed = JSON.parse(text);
@@ -376,7 +399,8 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
     }
 
     // ✅ Auto-fetch label + email (non-fatal)
-    (async () => {
+    // (Do not await -> checkout stays fast)
+    void (async () => {
       try {
         const pdf = await fetchBoxNowLabelPDF(orderNumber);
         const mailResult = await emailVoucherPdf({ orderNumber, pdfBuffer: pdf });
@@ -390,7 +414,13 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
     return res.json({
       boxnowOrderNumber: orderNumber,
       boxnowResponse: parsed ?? text,
+      rules: {
+        totalWeightKg: Number(totalWeightKg.toFixed(3)),
+        compartmentSize,
+        maxAllowedKg: 12,
+      },
       voucher: {
+        // NOTE: frontend should prefix with BACKEND_BASE (or you can return absolute)
         pdfUrl: `/api/boxnow/labels/order/${encodeURIComponent(orderNumber)}`,
         emailedTo: mailEnabled() ? VOUCHER_EMAIL_TO : null,
       },
@@ -403,34 +433,17 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
 
 /**
  * ✅ PDF label for a whole delivery request (orderNumber)
- * GET /api/v1/delivery-requests/{orderNumber}/label.pdf
  */
 app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
   try {
     const orderNumber = String(req.params.orderNumber || "").trim();
     if (!orderNumber) return res.status(400).json({ error: "Missing orderNumber" });
 
-    const token = await authToken();
-    const url = `${API_BASE}/api/v1/delivery-requests/${encodeURIComponent(orderNumber)}/label.pdf`;
-
-    const r = await fetch(url, {
-      method: "GET",
-      headers: {
-        ...buildHeaders(token),
-        accept: "application/pdf",
-      },
-    });
-
-    if (!r.ok) {
-      const txt = await r.text().catch(() => "");
-      return res.status(r.status).send(txt || `Label fetch failed (${r.status})`);
-    }
-
-    const buf = Buffer.from(await r.arrayBuffer());
+    const pdf = await fetchBoxNowLabelPDF(orderNumber);
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `inline; filename="BOXNOW-${orderNumber}.pdf"`);
-    return res.status(200).send(buf);
+    return res.status(200).send(pdf);
   } catch (e) {
     console.error("label(order) error:", e);
     return res.status(502).json({ message: "BoxNow order label error", details: String(e?.message || e) });
@@ -439,7 +452,6 @@ app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
 
 /**
  * ✅ PDF label for a single parcel (parcelId)
- * GET /api/v1/parcels/{parcelId}/label.pdf
  */
 app.get("/api/boxnow/labels/parcel/:parcelId", async (req, res) => {
   try {
