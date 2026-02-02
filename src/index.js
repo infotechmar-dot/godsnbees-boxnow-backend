@@ -14,7 +14,7 @@ app.use(
   })
 );
 
-// -------------------- STRIPE (TEST) --------------------
+// -------------------- STRIPE --------------------
 const STRIPE_SECRET_KEY = (process.env.STRIPE_SECRET_KEY || "").trim();
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
@@ -78,8 +78,14 @@ const CLIENT_SECRET = process.env.BOXNOW_CLIENT_SECRET;
 
 const PARTNER_ID = (process.env.BOXNOW_PARTNER_ID || "").trim();
 const DEFAULT_ORIGIN_LOCATION_ID = String(process.env.BOXNOW_WAREHOUSE_ID || "2");
+
 const ALLOW_COD = String(process.env.BOXNOW_ALLOW_COD || "false").toLowerCase() === "true";
-const FORCE_PREPAID = String(process.env.BOXNOW_FORCE_PREPAID_ST || "false").toLowerCase() === "true";
+
+// ✅ accept either env var name (so you don't get bitten by naming)
+const FORCE_PREPAID =
+  String(process.env.BOXNOW_FORCED_PREPAID ?? process.env.BOXNOW_FORCE_PREPAID_ST ?? "false")
+    .toLowerCase() === "true";
+
 const BOXNOW_ENV = (process.env.BOXNOW_ENV || "").toLowerCase(); // stage | production
 
 // -------------------- MAIL ENV --------------------
@@ -164,7 +170,7 @@ function mapPaymentModeToBoxNow(method) {
     "pay_on_go",
     "pay on go",
     "boxnow_pay_on_the_go",
-    "boxnow_pay_on_go"
+    "boxnow_pay_on_go",
   ];
 
   if (cod.includes(normalized)) return "cod";
@@ -172,18 +178,11 @@ function mapPaymentModeToBoxNow(method) {
   return "prepaid";
 }
 
-
 function parseKg(x) {
   if (x === null || x === undefined) return 0;
   const s = String(x).trim().replace(",", ".");
   const n = Number(s);
   return Number.isFinite(n) && n > 0 ? n : 0;
-}
-
-function kgToGrams(kg) {
-  const n = Number(kg);
-  if (!Number.isFinite(n) || n <= 0) return 0;
-  return Math.round(n * 1000);
 }
 
 // -------------------- TOKEN CACHE --------------------
@@ -379,7 +378,11 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
     }
 
     if (totalWeightKg > 12) {
-      return res.status(400).json({ error: "BOXNOW_MAX_WEIGHT_EXCEEDED", maxKg: 12, receivedKg: Number(totalWeightKg.toFixed(3)) });
+      return res.status(400).json({
+        error: "BOXNOW_MAX_WEIGHT_EXCEEDED",
+        maxKg: 12,
+        receivedKg: Number(totalWeightKg.toFixed(3)),
+      });
     }
 
     const compartmentSize = totalWeightKg <= 5 ? 2 : 3;
@@ -408,7 +411,8 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
           id: "1",
           name: String(order.parcelName || "Order"),
           value: invoiceValue,
-          weight: kgToGrams(totalWeightKg),
+          // ✅ IMPORTANT: BoxNow expects weight in KG (decimal), NOT grams.
+          weight: Number(totalWeightKg.toFixed(2)),
           compartmentSize,
         },
       ],
@@ -457,7 +461,3 @@ app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
-
-
-
-
