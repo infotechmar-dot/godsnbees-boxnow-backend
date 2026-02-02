@@ -156,11 +156,22 @@ function normalizePhone(phoneRaw) {
 function mapPaymentModeToBoxNow(method) {
   const normalized = String(method || "").toLowerCase();
   const prepaid = ["card", "stripe", "paypal", "bank_transfer", "bank transfer", "prepaid"];
-  const cod = ["cod", "cash_on_delivery", "cash on delivery", "boxnow_cod", "pay_on_go", "pay on go", "boxnow_pay_on_the_go"],"boxnow_pay_on_go";
+  const cod = [
+    "cod",
+    "cash_on_delivery",
+    "cash on delivery",
+    "boxnow_cod",
+    "pay_on_go",
+    "pay on go",
+    "boxnow_pay_on_the_go",
+    "boxnow_pay_on_go"
+  ];
+
   if (cod.includes(normalized)) return "cod";
   if (prepaid.includes(normalized)) return "prepaid";
   return "prepaid";
 }
+
 
 function parseKg(x) {
   if (x === null || x === undefined) return 0;
@@ -446,6 +457,7 @@ app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
+
 
 
 
