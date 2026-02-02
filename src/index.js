@@ -180,10 +180,35 @@ function mapPaymentModeToBoxNow(method) {
 
 function parseKg(x) {
   if (x === null || x === undefined) return 0;
-  const s = String(x).trim().replace(",", ".");
-  const n = Number(s);
-  return Number.isFinite(n) && n > 0 ? n : 0;
+
+  // αριθμός απευθείας
+  if (typeof x === "number" && Number.isFinite(x)) {
+    // heuristic: 220 / 7000 => γραμμάρια
+    return x > 50 ? x / 1000 : x;
+  }
+
+  let s = String(x).trim().toLowerCase();
+  if (!s) return 0;
+
+  // κόμμα → τελεία
+  s = s.replace(",", ".");
+
+  // gr → g
+  s = s.replace(/gr\b/g, "g");
+
+  const hasKg = /\bkg\b/.test(s);
+  const hasG = /\bg\b/.test(s);
+
+  const num = Number(s.replace(/[^0-9.]/g, ""));
+  if (!Number.isFinite(num) || num <= 0) return 0;
+
+  if (hasKg) return num;        // 0.22kg
+  if (hasG) return num / 1000; // 220g / 220gr
+
+  // χωρίς μονάδα
+  return num > 50 ? num / 1000 : num;
 }
+
 
 // -------------------- TOKEN CACHE --------------------
 let cachedToken = null;
@@ -461,3 +486,4 @@ app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
+
