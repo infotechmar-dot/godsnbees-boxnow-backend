@@ -34,7 +34,7 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req,
 
   if (event.type === "payment_intent.succeeded") {
     const pi = event.data.object;
-    console.log("✅ payment_intent.succeeded:", pi.id, pi.metadata);
+    console.log("✅ payment_intent.succeeded:", pi.id);
   }
 
   if (event.type === "payment_intent.payment_failed") {
@@ -82,9 +82,9 @@ const DEFAULT_ORIGIN_LOCATION_ID = String(process.env.BOXNOW_WAREHOUSE_ID || "2"
 const ALLOW_COD = String(process.env.BOXNOW_ALLOW_COD || "false").toLowerCase() === "true";
 
 // ✅ accept either env var name (so you don't get bitten by naming)
-const FORCE_PREPAID =
-  String(process.env.BOXNOW_FORCED_PREPAID ?? process.env.BOXNOW_FORCE_PREPAID_ST ?? "false")
-    .toLowerCase() === "true";
+const FORCE_PREPAID = String(
+  process.env.BOXNOW_FORCED_PREPAID ?? process.env.BOXNOW_FORCE_PREPAID_ST ?? "false"
+).toLowerCase() === "true";
 
 const BOXNOW_ENV = (process.env.BOXNOW_ENV || "").toLowerCase(); // stage | production
 
@@ -161,6 +161,7 @@ function normalizePhone(phoneRaw) {
 
 function mapPaymentModeToBoxNow(method) {
   const normalized = String(method || "").toLowerCase();
+
   const prepaid = ["card", "stripe", "paypal", "bank_transfer", "bank transfer", "prepaid"];
   const cod = [
     "cod",
@@ -178,22 +179,23 @@ function mapPaymentModeToBoxNow(method) {
   return "prepaid";
 }
 
+/**
+ * Parse KG from number/string:
+ * - 0.22 / "0,22" / "0.22kg"
+ * - "220" => grams heuristic => 0.22kg
+ * - "220g" / "220gr"
+ */
 function parseKg(x) {
   if (x === null || x === undefined) return 0;
 
-  // αριθμός απευθείας
   if (typeof x === "number" && Number.isFinite(x)) {
-    // heuristic: 220 / 7000 => γραμμάρια
     return x > 50 ? x / 1000 : x;
   }
 
   let s = String(x).trim().toLowerCase();
   if (!s) return 0;
 
-  // κόμμα → τελεία
   s = s.replace(",", ".");
-
-  // gr → g
   s = s.replace(/gr\b/g, "g");
 
   const hasKg = /\bkg\b/.test(s);
@@ -202,13 +204,40 @@ function parseKg(x) {
   const num = Number(s.replace(/[^0-9.]/g, ""));
   if (!Number.isFinite(num) || num <= 0) return 0;
 
-  if (hasKg) return num;        // 0.22kg
-  if (hasG) return num / 1000; // 220g / 220gr
+  if (hasKg) return num;
+  if (hasG) return num / 1000;
 
-  // χωρίς μονάδα
   return num > 50 ? num / 1000 : num;
 }
 
+/**
+ * ✅ TOTAL WEIGHT RULE (integration-first):
+ * Priority:
+ * 1) order.cartWeightKg (frontend computed canonical)
+ * 2) order.weightKg / order.weight (if provided)
+ * 3) sum(items[i].weightKg) * qty
+ * 4) sum(items[i].weight) * qty
+ *
+ * NOTE: We do NOT parse titles/names here.
+ */
+function computeTotalWeightKg(order) {
+  const fromCart = parseKg(order?.cartWeightKg);
+  if (fromCart > 0) return fromCart;
+
+  const fromOrder = parseKg(order?.weightKg ?? order?.weight);
+  if (fromOrder > 0) return fromOrder;
+
+  const items = Array.isArray(order?.items) ? order.items : [];
+  let sum = 0;
+
+  for (const it of items) {
+    const qty = Math.max(1, Number(it?.quantity || 1) || 1);
+    const w = parseKg(it?.weightKg) || parseKg(it?.weight);
+    if (w > 0) sum += w * qty;
+  }
+
+  return sum;
+}
 
 // -------------------- TOKEN CACHE --------------------
 let cachedToken = null;
@@ -272,10 +301,7 @@ async function fetchBoxNowLabelPDF(orderNumber) {
 
   const r = await fetch(url, {
     method: "GET",
-    headers: {
-      ...buildHeaders(token),
-      accept: "application/pdf",
-    },
+    headers: { ...buildHeaders(token), accept: "application/pdf" },
   });
 
   if (!r.ok) {
@@ -288,10 +314,7 @@ async function fetchBoxNowLabelPDF(orderNumber) {
 
 async function emailVoucherPdf({ orderNumber, pdfBuffer }) {
   const transporter = getMailer();
-  if (!transporter) {
-    console.warn("✉️ Mail not configured. Skipping voucher email.");
-    return { sent: false, reason: "mail_not_configured" };
-  }
+  if (!transporter) return { sent: false, reason: "mail_not_configured" };
 
   const toList = VOUCHER_EMAIL_TO.split(",").map((s) => s.trim()).filter(Boolean);
 
@@ -300,12 +323,7 @@ async function emailVoucherPdf({ orderNumber, pdfBuffer }) {
     to: toList,
     subject: `BOXNOW Voucher – ${orderNumber}`,
     text: `Επισυνάπτεται το BoxNow voucher (PDF) για την αποστολή ${orderNumber}.`,
-    attachments: [
-      {
-        filename: `BOXNOW-${orderNumber}.pdf`,
-        content: pdfBuffer,
-      },
-    ],
+    attachments: [{ filename: `BOXNOW-${orderNumber}.pdf`, content: pdfBuffer }],
   });
 
   return { sent: true, to: toList };
@@ -328,7 +346,6 @@ app.get("/api/boxnow/destinations", async (req, res) => {
 
     res.type("json").send(text);
   } catch (e) {
-    console.error("destinations error:", e);
     res.status(502).json({ message: "BoxNow destinations error", details: String(e?.message || e) });
   }
 });
@@ -347,7 +364,6 @@ app.get("/api/boxnow/origins", async (req, res) => {
 
     res.type("json").send(text);
   } catch (e) {
-    console.error("origins error:", e);
     res.status(502).json({ message: "BoxNow origins error", details: String(e?.message || e) });
   }
 });
@@ -389,17 +405,13 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
       return res.status(400).json({ error: "Missing customer contact fields (name/email/phone)" });
     }
 
-    const totalWeightKg =
-      parseKg(order.weightKg ?? order.weight ?? 0) ||
-      (Array.isArray(order.items)
-        ? order.items.reduce(
-            (sum, it) => sum + parseKg(it.weightKg ?? it.weight ?? 0) * (Number(it.quantity || 1) || 1),
-            0
-          )
-        : 0);
+    const totalWeightKg = computeTotalWeightKg(order);
 
     if (!Number.isFinite(totalWeightKg) || totalWeightKg <= 0) {
-      return res.status(400).json({ error: "MISSING_WEIGHT", message: "Total weight missing/invalid." });
+      return res.status(400).json({
+        error: "MISSING_WEIGHT",
+        message: "Total weight missing/invalid. Provide cartWeightKg or item.weightKg/weight.",
+      });
     }
 
     if (totalWeightKg > 12) {
@@ -436,7 +448,7 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
           id: "1",
           name: String(order.parcelName || "Order"),
           value: invoiceValue,
-          // ✅ IMPORTANT: BoxNow expects weight in KG (decimal), NOT grams.
+          // ✅ IMPORTANT: BoxNow expects weight in KG (decimal)
           weight: Number(totalWeightKg.toFixed(2)),
           compartmentSize,
         },
@@ -451,7 +463,8 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
     const text = await r.text();
     if (!r.ok) return res.status(r.status).send(text);
 
-    void (async () => {
+    // fire-and-forget voucher email
+    (async () => {
       try {
         const pdf = await fetchBoxNowLabelPDF(orderNumber);
         await emailVoucherPdf({ orderNumber, pdfBuffer: pdf });
@@ -486,4 +499,6 @@ app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
+
+
 
