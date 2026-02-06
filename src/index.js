@@ -3,6 +3,12 @@ import express from "express";
 import cors from "cors";
 import nodemailer from "nodemailer";
 import Stripe from "stripe";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 
@@ -20,7 +26,7 @@ const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
 // ✅ Webhook MUST be BEFORE express.json()
-app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req, res) => {
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   if (!stripe) return res.status(500).send("Stripe not configured");
   if (!STRIPE_WEBHOOK_SECRET) return res.status(500).send("Missing STRIPE_WEBHOOK_SECRET");
 
@@ -35,6 +41,9 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req,
   if (event.type === "payment_intent.succeeded") {
     const pi = event.data.object;
     console.log("✅ payment_intent.succeeded:", pi.id);
+
+    // ✅ Create order after successful payment
+    // (Frontend will call /api/orders/create with stripeIntentId)
   }
 
   if (event.type === "payment_intent.payment_failed") {
@@ -68,6 +77,151 @@ app.post("/api/stripe/create-payment-intent", async (req, res) => {
     return res.json({ clientSecret: pi.client_secret, id: pi.id });
   } catch (e) {
     return res.status(400).json({ error: e.message });
+  }
+});
+
+// -------------------- ORDER STORAGE --------------------
+const ORDERS_FILE = path.join(__dirname, "data", "orders.json");
+
+function ensureOrdersFile() {
+  const dir = path.dirname(ORDERS_FILE);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, JSON.stringify({ orders: [] }));
+}
+
+function readOrders() {
+  ensureOrdersFile();
+  const data = fs.readFileSync(ORDERS_FILE, "utf8");
+  return JSON.parse(data);
+}
+
+function writeOrders(data) {
+  ensureOrdersFile();
+  fs.writeFileSync(ORDERS_FILE, JSON.stringify(data, null, 2));
+}
+
+function generateOrderNumber() {
+  return `ORD-${Date.now()}`;
+}
+
+// ✅ UPDATE ORDER METADATA
+function updateOrderMetadata(orderNumber, metadata) {
+  const data = readOrders();
+  const order = data.orders.find((o) => o.orderNumber === orderNumber);
+
+  if (!order) throw new Error(`Order ${orderNumber} not found`);
+
+  // shallow merge: metadata.payment / metadata.boxnow overwrite as objects if provided
+  order.metadata = { ...order.metadata, ...metadata };
+  writeOrders(data);
+  return order;
+}
+
+// ✅ CREATE ORDER ENDPOINT
+app.post("/api/orders/create", async (req, res) => {
+  try {
+    const {
+      orderNumber = generateOrderNumber(),
+      items = [],
+      customer = {},
+      total = 0,
+      cartWeightKg = 0,
+      paymentMethod = "cod",
+      paymentDetails = {},
+      boxnow = {},
+      shippingCost = 0,
+      discountAmount = 0,
+    } = req.body || {};
+
+    // Validation
+    if (!items.length) return res.status(400).json({ success: false, error: "No items in order" });
+    if (!customer.name || !customer.email || !customer.phone) {
+      return res.status(400).json({ success: false, error: "Missing customer details" });
+    }
+
+    const subtotal = items.reduce(
+      (sum, item) => sum + Number(item.price) * Number(item.quantity || 1),
+      0
+    );
+
+    const order = {
+      id: orderNumber,
+      orderNumber,
+      items: items.map((item) => ({
+        id: item.id,
+        name: item.name,
+        price: Number(item.price),
+        quantity: Number(item.quantity || 1),
+        weightKg: Number(item.weightKg || 0),
+      })),
+      customer: {
+        name: String(customer.name),
+        email: String(customer.email),
+        phone: String(customer.phone),
+      },
+      totals: {
+        subtotal: Number(subtotal.toFixed(2)),
+        shipping: Number(shippingCost || 0),
+        discount: Number(discountAmount || 0),
+        total: Number(total || 0),
+      },
+      metadata: {
+        payment: {
+          method: String(paymentMethod),
+          stripeIntentId: paymentDetails.stripeIntentId || null,
+          paypalOrderId: paymentDetails.paypalOrderId || null,
+          status: paymentDetails.status || "pending",
+        },
+        boxnow: {
+          lockerId: boxnow.lockerId || null,
+          pickupName: boxnow.pickupName || null,
+          pickupAddress: boxnow.pickupAddress || null,
+          parcelId: null,
+          trackingNumber: null,
+          labelUrl: null,
+          error: null,
+        },
+      },
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    };
+
+    // Save order
+    const data = readOrders();
+    data.orders.push(order);
+    writeOrders(data);
+
+    console.log("[ORDER_CREATED]", {
+      orderId: order.id,
+      orderNumber: order.orderNumber,
+      paymentMethod,
+      total,
+      cartWeightKg,
+    });
+
+    res.json({
+      success: true,
+      orderId: order.id,
+      orderNumber: order.orderNumber,
+      metadata: order.metadata,
+    });
+  } catch (e) {
+    console.error("[ORDER_CREATE_ERROR]", e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ✅ GET ORDER (for debugging)
+app.get("/api/orders/:orderNumber", (req, res) => {
+  try {
+    const { orderNumber } = req.params;
+    const data = readOrders();
+    const order = data.orders.find((o) => o.orderNumber === orderNumber);
+
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    res.json(order);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -171,6 +325,7 @@ function mapPaymentModeToBoxNow(method) {
     "pay_on_go",
     "pay on go",
     "boxnow_pay_on_the_go",
+    "boxnow_pay_on_go",
     "boxnow_pay_on_go",
   ];
 
@@ -282,9 +437,9 @@ function buildHeaders(token) {
   return h;
 }
 
-async function boxnowApiFetch(path, opts = {}) {
+async function boxnowApiFetch(p, opts = {}) {
   const token = await authToken();
-  const url = `${API_BASE}${path.startsWith("/") ? "" : "/"}${path}`;
+  const url = `${API_BASE}${p.startsWith("/") ? "" : "/"}${p}`;
   return fetch(url, {
     ...opts,
     headers: {
@@ -368,6 +523,7 @@ app.get("/api/boxnow/origins", async (req, res) => {
   }
 });
 
+// ✅ UPDATED delivery-requests (stores metadata + emails voucher)
 app.post("/api/boxnow/delivery-requests", async (req, res) => {
   try {
     const order = req.body || {};
@@ -389,6 +545,7 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
 
     const originLocationId = String(order.originLocationId || DEFAULT_ORIGIN_LOCATION_ID);
 
+    // ✅ USE orderNumber from order (not generate new)
     const orderNumber = String(order.orderNumber || `ORD-${Date.now()}`);
     const invoiceValueNum = Number(order.invoiceValue ?? order.total ?? order.amountToBeCollected ?? 0);
     const invoiceValue = safeMoney(invoiceValueNum);
@@ -448,12 +605,13 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
           id: "1",
           name: String(order.parcelName || "Order"),
           value: invoiceValue,
-          // ✅ IMPORTANT: BoxNow expects weight in KG (decimal)
           weight: Number(totalWeightKg.toFixed(2)),
           compartmentSize,
         },
       ],
     };
+
+    console.log("[BOXNOW_REQUEST]", { orderNumber, destinationLocationId, totalWeightKg });
 
     const r = await boxnowApiFetch("/api/v1/delivery-requests", {
       method: "POST",
@@ -461,24 +619,61 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
     });
 
     const text = await r.text();
-    if (!r.ok) return res.status(r.status).send(text);
+    if (!r.ok) {
+      // ✅ Update order metadata with error
+      try {
+        updateOrderMetadata(orderNumber, {
+          boxnow: { error: text.slice(0, 200) },
+        });
+      } catch (err) {
+        console.error("[METADATA_UPDATE_ERROR]", err.message);
+      }
+      return res.status(r.status).send(text);
+    }
+
+    const responseData = JSON.parse(text);
+    const parcelId = responseData?.id || responseData?.parcelId;
+    const trackingNumber = responseData?.trackingNumber || responseData?.referenceNumber;
+
+    console.log("[BOXNOW_SUCCESS]", { orderNumber, parcelId, trackingNumber });
+
+    // ✅ Update order metadata with BoxNow details
+    try {
+      updateOrderMetadata(orderNumber, {
+        boxnow: {
+          lockerId: destinationLocationId,
+          pickupName: order.pickupName || null,
+          pickupAddress: order.pickupAddress || null,
+          parcelId,
+          trackingNumber,
+          labelUrl: null,
+          error: null,
+        },
+      });
+    } catch (err) {
+      console.error("[METADATA_UPDATE_ERROR]", err.message);
+    }
 
     // fire-and-forget voucher email
     (async () => {
       try {
         const pdf = await fetchBoxNowLabelPDF(orderNumber);
-        await emailVoucherPdf({ orderNumber, pdfBuffer: pdf });
+        const emailResult = await emailVoucherPdf({ orderNumber, pdfBuffer: pdf });
+        console.log("[EMAIL_SENT]", { orderNumber, ...emailResult });
       } catch (err) {
-        console.error("✉️ Voucher auto-email failed:", err?.message || err);
+        console.error("[EMAIL_ERROR]", { orderNumber, error: err?.message || String(err) });
       }
     })();
 
-    return res.json({
-      boxnowOrderNumber: orderNumber,
-      voucher: { pdfUrl: `/api/boxnow/labels/order/${encodeURIComponent(orderNumber)}` },
+    res.json({
+      success: true,
+      parcelId,
+      trackingNumber,
+      orderNumber,
     });
   } catch (e) {
-    res.status(502).json({ message: "BoxNow delivery request error", details: String(e?.message || e) });
+    console.error("[BOXNOW_ERROR]", e?.message || e);
+    res.status(502).json({ message: "BoxNow error", details: String(e?.message || e) });
   }
 });
 
@@ -493,12 +688,11 @@ app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
     res.setHeader("Content-Disposition", `inline; filename="BOXNOW-${orderNumber}.pdf"`);
     return res.status(200).send(pdf);
   } catch (e) {
-    return res.status(502).json({ message: "BoxNow order label error", details: String(e?.message || e) });
+    return res
+      .status(502)
+      .json({ message: "BoxNow order label error", details: String(e?.message || e) });
   }
 });
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
-
-
-
