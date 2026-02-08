@@ -20,39 +20,56 @@ app.use(
   })
 );
 
+// -------------------- PUBLIC CONFIG (for Horizons frontend runtime) --------------------
+// ✅ Returns ONLY public values (safe to expose)
+app.get("/api/public-config", (_req, res) => {
+  res.json({
+    stripePublishableKey: (process.env.STRIPE_PUBLISHABLE_KEY || "").trim(),
+    paypalClientId: (process.env.PAYPAL_CLIENT_ID || "").trim(),
+  });
+});
+
 // -------------------- STRIPE --------------------
 const STRIPE_SECRET_KEY = (process.env.STRIPE_SECRET_KEY || "").trim();
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
-const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+
+// ✅ Stripe client (null if not configured)
+const stripe = STRIPE_SECRET_KEY
+  ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" })
+  : null;
 
 // ✅ Webhook MUST be BEFORE express.json()
-app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  if (!stripe) return res.status(500).send("Stripe not configured");
-  if (!STRIPE_WEBHOOK_SECRET) return res.status(500).send("Missing STRIPE_WEBHOOK_SECRET");
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    if (!stripe) return res.status(500).send("Stripe not configured");
+    if (!STRIPE_WEBHOOK_SECRET) return res.status(500).send("Missing STRIPE_WEBHOOK_SECRET");
 
-  let event;
-  try {
-    const sig = req.headers["stripe-signature"];
-    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    let event;
+    try {
+      const sig = req.headers["stripe-signature"];
+      if (!sig) return res.status(400).send("Missing stripe-signature header");
+
+      event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    if (event.type === "payment_intent.succeeded") {
+      const pi = event.data.object;
+      console.log("✅ payment_intent.succeeded:", pi.id);
+      // ✅ You can optionally update order status here (if you store stripeIntentId -> orderNumber mapping)
+    }
+
+    if (event.type === "payment_intent.payment_failed") {
+      const pi = event.data.object;
+      console.log("❌ payment_intent.payment_failed:", pi.id);
+    }
+
+    res.json({ received: true });
   }
-
-  if (event.type === "payment_intent.succeeded") {
-    const pi = event.data.object;
-    console.log("✅ payment_intent.succeeded:", pi.id);
-
-    // ✅ Create order after successful payment
-    // (Frontend will call /api/orders/create with stripeIntentId)
-  }
-
-  if (event.type === "payment_intent.payment_failed") {
-    const pi = event.data.object;
-    console.log("❌ payment_intent.payment_failed:", pi.id);
-  }
-
-  res.json({ received: true });
-});
+);
 
 // ✅ JSON middleware for everything else
 app.use(express.json({ limit: "1mb" }));
@@ -63,6 +80,8 @@ app.post("/api/stripe/create-payment-intent", async (req, res) => {
     if (!stripe) return res.status(500).json({ error: "Stripe not configured" });
 
     const { amount, currency = "eur", metadata = {} } = req.body || {};
+
+    // amount in integer cents
     if (!Number.isInteger(amount) || amount < 50) {
       return res.status(400).json({ error: "Invalid amount (integer cents, min 50)." });
     }
@@ -165,6 +184,7 @@ app.post("/api/orders/create", async (req, res) => {
         discount: Number(discountAmount || 0),
         total: Number(total || 0),
       },
+      cartWeightKg: Number(cartWeightKg || 0),
       metadata: {
         payment: {
           method: String(paymentMethod),
@@ -326,7 +346,6 @@ function mapPaymentModeToBoxNow(method) {
     "pay on go",
     "boxnow_pay_on_the_go",
     "boxnow_pay_on_go",
-    "boxnow_pay_on_go",
   ];
 
   if (cod.includes(normalized)) return "cod";
@@ -372,8 +391,6 @@ function parseKg(x) {
  * 2) order.weightKg / order.weight (if provided)
  * 3) sum(items[i].weightKg) * qty
  * 4) sum(items[i].weight) * qty
- *
- * NOTE: We do NOT parse titles/names here.
  */
 function computeTotalWeightKg(order) {
   const fromCart = parseKg(order?.cartWeightKg);
