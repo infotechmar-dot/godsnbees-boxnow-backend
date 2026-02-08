@@ -1,4 +1,7 @@
-import "dotenv/config";
+// src/index.js
+import dotenv from "dotenv";
+dotenv.config();
+
 import express from "express";
 import cors from "cors";
 import nodemailer from "nodemailer";
@@ -59,7 +62,7 @@ app.post(
     if (event.type === "payment_intent.succeeded") {
       const pi = event.data.object;
       console.log("✅ payment_intent.succeeded:", pi.id);
-      // ✅ You can optionally update order status here (if you store stripeIntentId -> orderNumber mapping)
+      // Optional: update order status here if you map stripeIntentId -> orderNumber
     }
 
     if (event.type === "payment_intent.payment_failed") {
@@ -73,6 +76,7 @@ app.post(
 
 // ✅ JSON middleware for everything else
 app.use(express.json({ limit: "1mb" }));
+
 // -------------------- HOSTINGER STORE MANAGER (HORIZONS) --------------------
 const HORIZONS_API_URL = (process.env.HORIZONS_API_URL || "https://api.horizons.app/v1").trim();
 const HORIZONS_STORE_ID = (process.env.HORIZONS_STORE_ID || "").trim();
@@ -126,8 +130,7 @@ app.post("/api/store/create-order", async (req, res) => {
         })),
         customer: {
           firstName: customer.firstName || String(customer.name || "").split(" ")[0] || "",
-          lastName:
-            customer.lastName || String(customer.name || "").split(" ").slice(1).join(" ") || "",
+          lastName: customer.lastName || String(customer.name || "").split(" ").slice(1).join(" ") || "",
           email: customer.email,
           phone: customer.phone || "",
         },
@@ -221,20 +224,40 @@ function updateOrderMetadata(orderNumber, metadata) {
 
   if (!order) throw new Error(`Order ${orderNumber} not found`);
 
-  // shallow merge: metadata.payment / metadata.boxnow overwrite as objects if provided
+  // shallow merge
   order.metadata = { ...order.metadata, ...metadata };
   writeOrders(data);
   return order;
 }
 
-// ✅ CREATE ORDER ENDPOINT
+// -------------------- MONEY HELPERS (SERVER-SIDE TRUTH) --------------------
+function toNum(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function priceToCents(item) {
+  if (item?.price_in_cents != null) return Math.max(0, Math.round(toNum(item.price_in_cents)));
+  if (item?.variant?.price_in_cents != null)
+    return Math.max(0, Math.round(toNum(item.variant.price_in_cents)));
+
+  const eur =
+    item?.price != null
+      ? toNum(item.price)
+      : item?.variant?.price != null
+      ? toNum(item.variant.price)
+      : 0;
+
+  return Math.max(0, Math.round(eur * 100));
+}
+
+// ✅ CREATE ORDER ENDPOINT (server computes totals)
 app.post("/api/orders/create", async (req, res) => {
   try {
     const {
       orderNumber = generateOrderNumber(),
       items = [],
       customer = {},
-      total = 0,
       cartWeightKg = 0,
       paymentMethod = "cod",
       paymentDetails = {},
@@ -249,21 +272,35 @@ app.post("/api/orders/create", async (req, res) => {
       return res.status(400).json({ success: false, error: "Missing customer details" });
     }
 
-    const subtotal = items.reduce(
-      (sum, item) => sum + Number(item.price) * Number(item.quantity || 1),
-      0
-    );
+    // ✅ totals in cents (avoid float errors, never trust client total)
+    const subtotalCents = items.reduce((sum, item) => {
+      const qty = Math.max(1, Math.round(toNum(item.quantity || 1)));
+      return sum + priceToCents(item) * qty;
+    }, 0);
+
+    const shippingCents = Math.max(0, Math.round(toNum(shippingCost || 0) * 100));
+    const discountCents = Math.max(0, Math.round(toNum(discountAmount || 0) * 100));
+    const totalCents = Math.max(0, subtotalCents + shippingCents - discountCents);
+
+    const subtotal = subtotalCents / 100;
+    const shipping = shippingCents / 100;
+    const discount = discountCents / 100;
+    const total = totalCents / 100;
 
     const order = {
       id: orderNumber,
       orderNumber,
-      items: items.map((item) => ({
-        id: item.id,
-        name: item.name,
-        price: Number(item.price),
-        quantity: Number(item.quantity || 1),
-        weightKg: Number(item.weightKg || 0),
-      })),
+      items: items.map((item) => {
+        const pc = priceToCents(item);
+        return {
+          id: item.id,
+          name: item.name,
+          price: Number((pc / 100).toFixed(2)),
+          price_in_cents: pc,
+          quantity: Math.max(1, Math.round(toNum(item.quantity || 1))),
+          weightKg: Number(item.weightKg || 0),
+        };
+      }),
       customer: {
         name: String(customer.name),
         email: String(customer.email),
@@ -271,9 +308,9 @@ app.post("/api/orders/create", async (req, res) => {
       },
       totals: {
         subtotal: Number(subtotal.toFixed(2)),
-        shipping: Number(shippingCost || 0),
-        discount: Number(discountAmount || 0),
-        total: Number(total || 0),
+        shipping: Number(shipping.toFixed(2)),
+        discount: Number(discount.toFixed(2)),
+        total: Number(total.toFixed(2)),
       },
       cartWeightKg: Number(cartWeightKg || 0),
       metadata: {
@@ -306,6 +343,9 @@ app.post("/api/orders/create", async (req, res) => {
       orderId: order.id,
       orderNumber: order.orderNumber,
       paymentMethod,
+      subtotal,
+      shipping,
+      discount,
       total,
       cartWeightKg,
     });
@@ -315,6 +355,7 @@ app.post("/api/orders/create", async (req, res) => {
       orderId: order.id,
       orderNumber: order.orderNumber,
       metadata: order.metadata,
+      totals: order.totals,
     });
   } catch (e) {
     console.error("[ORDER_CREATE_ERROR]", e.message);
@@ -346,7 +387,7 @@ const DEFAULT_ORIGIN_LOCATION_ID = String(process.env.BOXNOW_WAREHOUSE_ID || "2"
 
 const ALLOW_COD = String(process.env.BOXNOW_ALLOW_COD || "false").toLowerCase() === "true";
 
-// ✅ accept either env var name (so you don't get bitten by naming)
+// ✅ accept either env var name
 const FORCE_PREPAID = String(
   process.env.BOXNOW_FORCED_PREPAID ?? process.env.BOXNOW_FORCE_PREPAID_ST ?? "false"
 ).toLowerCase() === "true";
@@ -728,7 +769,6 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
 
     const text = await r.text();
     if (!r.ok) {
-      // ✅ Update order metadata with error
       try {
         updateOrderMetadata(orderNumber, {
           boxnow: { error: text.slice(0, 200) },
@@ -745,7 +785,6 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
 
     console.log("[BOXNOW_SUCCESS]", { orderNumber, parcelId, trackingNumber });
 
-    // ✅ Update order metadata with BoxNow details
     try {
       updateOrderMetadata(orderNumber, {
         boxnow: {
@@ -804,4 +843,3 @@ app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
-
