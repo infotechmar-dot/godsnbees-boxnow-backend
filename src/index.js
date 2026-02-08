@@ -73,6 +73,97 @@ app.post(
 
 // ✅ JSON middleware for everything else
 app.use(express.json({ limit: "1mb" }));
+// -------------------- HOSTINGER STORE MANAGER (HORIZONS) --------------------
+const HORIZONS_API_URL = (process.env.HORIZONS_API_URL || "https://api.horizons.app/v1").trim();
+const HORIZONS_STORE_ID = (process.env.HORIZONS_STORE_ID || "").trim();
+const HORIZONS_API_KEY = (process.env.HORIZONS_API_KEY || "").trim();
+
+// ✅ Server-side create store order (appears in Integrations → Store Manager)
+app.post("/api/store/create-order", async (req, res) => {
+  try {
+    if (!HORIZONS_STORE_ID) {
+      return res.status(500).json({ success: false, error: "Missing HORIZONS_STORE_ID" });
+    }
+    if (!HORIZONS_API_KEY) {
+      return res.status(500).json({ success: false, error: "Missing HORIZONS_API_KEY" });
+    }
+
+    const orderData = req.body || {};
+    const {
+      orderNumber,
+      items = [],
+      customer = {},
+      totals = {},
+      metadata = {},
+      timestamp = new Date().toISOString(),
+    } = orderData;
+
+    if (!orderNumber || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, error: "Missing orderNumber/items" });
+    }
+    if (!customer?.email) {
+      return res.status(400).json({ success: false, error: "Missing customer.email" });
+    }
+    if (!totals?.total) {
+      return res.status(400).json({ success: false, error: "Missing totals.total" });
+    }
+
+    const url = `${HORIZONS_API_URL}/stores/${encodeURIComponent(HORIZONS_STORE_ID)}/orders`;
+
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${HORIZONS_API_KEY}`,
+      },
+      body: JSON.stringify({
+        orderNumber,
+        items: items.map((item) => ({
+          name: item.name,
+          quantity: Number(item.quantity || 1),
+          price: Number(item.price || 0),
+          sku: item.id || item.sku || "",
+        })),
+        customer: {
+          firstName: customer.firstName || String(customer.name || "").split(" ")[0] || "",
+          lastName:
+            customer.lastName || String(customer.name || "").split(" ").slice(1).join(" ") || "",
+          email: customer.email,
+          phone: customer.phone || "",
+        },
+        totals,
+        metadata,
+        timestamp,
+      }),
+    });
+
+    const text = await r.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+
+    if (!r.ok) {
+      return res.status(r.status).json({
+        success: false,
+        error: `Store API error ${r.status}`,
+        details: data,
+      });
+    }
+
+    const storeOrderId = data?.id || data?.orderId || null;
+
+    return res.json({
+      success: true,
+      storeOrderId,
+      data,
+    });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e?.message || String(e) });
+  }
+});
 
 // ✅ Create PaymentIntent (returns clientSecret)
 app.post("/api/stripe/create-payment-intent", async (req, res) => {
@@ -713,3 +804,4 @@ app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
+
