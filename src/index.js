@@ -108,9 +108,9 @@ app.post("/api/store/create-order", async (req, res) => {
     if (!customer?.email) {
       return res.status(400).json({ success: false, error: "Missing customer.email" });
     }
-    if (!totals?.total) {
-      return res.status(400).json({ success: false, error: "Missing totals.total" });
-    }
+    if (totals?.total == null) {
+  return res.status(400).json({ success: false, error: "Missing totals.total" });
+}
 
     const url = `${HORIZONS_API_URL}/stores/${encodeURIComponent(HORIZONS_STORE_ID)}/orders`;
 
@@ -363,7 +363,7 @@ app.post("/api/orders/create", async (req, res) => {
   }
 });
 
-// ✅ GET ORDER (for debugging)
+// ✅ GET ORDER (returns order + recomputed totals so old wrong totals get fixed)
 app.get("/api/orders/:orderNumber", (req, res) => {
   try {
     const { orderNumber } = req.params;
@@ -371,11 +371,43 @@ app.get("/api/orders/:orderNumber", (req, res) => {
     const order = data.orders.find((o) => o.orderNumber === orderNumber);
 
     if (!order) return res.status(404).json({ error: "Order not found" });
-    res.json(order);
+
+    const items = Array.isArray(order.items) ? order.items : [];
+
+    // recompute subtotal from stored items (prefer cents)
+    const subtotalCents = items.reduce((sum, it) => {
+      const qty = Math.max(1, Math.round(toNum(it?.quantity || 1)));
+
+      const priceCents =
+        it?.price_in_cents != null
+          ? Math.max(0, Math.round(toNum(it.price_in_cents)))
+          : Math.max(0, Math.round(toNum(it?.price || 0) * 100));
+
+      return sum + priceCents * qty;
+    }, 0);
+
+    const shippingCents = Math.max(0, Math.round(toNum(order?.totals?.shipping || 0) * 100));
+    const discountCents = Math.max(0, Math.round(toNum(order?.totals?.discount || 0) * 100));
+    const totalCents = Math.max(0, subtotalCents + shippingCents - discountCents);
+
+    const fixedTotals = {
+      ...(order.totals || {}),
+      subtotal: Number((subtotalCents / 100).toFixed(2)),
+      shipping: Number((shippingCents / 100).toFixed(2)),
+      discount: Number((discountCents / 100).toFixed(2)),
+      total: Number((totalCents / 100).toFixed(2)),
+      _recomputed: true, // 👈 για να βλέπεις ότι όντως τρέχει ο νέος κώδικας
+    };
+
+    return res.json({
+      ...order,
+      totals: fixedTotals,
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
+
 
 // -------------------- ENV --------------------
 const RAW_API_URL = (process.env.BOXNOW_API_URL || "").trim();
@@ -843,3 +875,4 @@ app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
+
