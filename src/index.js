@@ -1,4 +1,3 @@
-// src/index.js
 import dotenv from "dotenv";
 dotenv.config();
 
@@ -109,8 +108,8 @@ app.post("/api/store/create-order", async (req, res) => {
       return res.status(400).json({ success: false, error: "Missing customer.email" });
     }
     if (totals?.total == null) {
-  return res.status(400).json({ success: false, error: "Missing totals.total" });
-}
+      return res.status(400).json({ success: false, error: "Missing totals.total" });
+    }
 
     const url = `${HORIZONS_API_URL}/stores/${encodeURIComponent(HORIZONS_STORE_ID)}/orders`;
 
@@ -130,7 +129,10 @@ app.post("/api/store/create-order", async (req, res) => {
         })),
         customer: {
           firstName: customer.firstName || String(customer.name || "").split(" ")[0] || "",
-          lastName: customer.lastName || String(customer.name || "").split(" ").slice(1).join(" ") || "",
+          lastName:
+            customer.lastName ||
+            String(customer.name || "").split(" ").slice(1).join(" ") ||
+            "",
           email: customer.email,
           phone: customer.phone || "",
         },
@@ -407,7 +409,6 @@ app.get("/api/orders/:orderNumber", (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
 
 // -------------------- ENV --------------------
 const RAW_API_URL = (process.env.BOXNOW_API_URL || "").trim();
@@ -719,10 +720,7 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
     const customerPhone = normalizePhone(customerPhoneRaw);
 
     const destinationLocationId =
-      order.destinationLocationId ??
-      order.destination?.locationId ??
-      order.selectedLockerId ??
-      order.lockerId;
+      order.destinationLocationId ?? order.destination?.locationId ?? order.selectedLockerId ?? order.lockerId;
 
     const originLocationId = String(order.originLocationId || DEFAULT_ORIGIN_LOCATION_ID);
 
@@ -731,7 +729,8 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
     const invoiceValueNum = Number(order.invoiceValue ?? order.total ?? order.amountToBeCollected ?? 0);
     const invoiceValue = safeMoney(invoiceValueNum);
 
-    let paymentMode = mapPaymentModeToBoxNow(order.paymentMode);
+    // Accept either paymentMode OR paymentMethod from frontend
+    let paymentMode = mapPaymentModeToBoxNow(order.paymentMode ?? order.paymentMethod);
     if (FORCE_PREPAID) paymentMode = "prepaid";
     if (paymentMode === "cod" && !ALLOW_COD) paymentMode = "prepaid";
 
@@ -792,7 +791,7 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
       ],
     };
 
-    console.log("[BOXNOW_REQUEST]", { orderNumber, destinationLocationId, totalWeightKg });
+    console.log("[BOXNOW_REQUEST]", { orderNumber, destinationLocationId, totalWeightKg, paymentMode });
 
     const r = await boxnowApiFetch("/api/v1/delivery-requests", {
       method: "POST",
@@ -875,4 +874,5 @@ app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
+
 
