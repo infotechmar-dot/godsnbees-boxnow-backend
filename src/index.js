@@ -23,7 +23,6 @@ app.use(
 );
 
 // -------------------- PUBLIC CONFIG (for Horizons frontend runtime) --------------------
-// ✅ Returns ONLY public values (safe to expose)
 app.get("/api/public-config", (_req, res) => {
   res.json({
     stripePublishableKey: (process.env.STRIPE_PUBLISHABLE_KEY || "").trim(),
@@ -35,43 +34,34 @@ app.get("/api/public-config", (_req, res) => {
 const STRIPE_SECRET_KEY = (process.env.STRIPE_SECRET_KEY || "").trim();
 const STRIPE_WEBHOOK_SECRET = (process.env.STRIPE_WEBHOOK_SECRET || "").trim();
 
-// ✅ Stripe client (null if not configured)
-const stripe = STRIPE_SECRET_KEY
-  ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" })
-  : null;
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" }) : null;
 
 // ✅ Webhook MUST be BEFORE express.json()
-app.post(
-  "/api/stripe/webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    if (!stripe) return res.status(500).send("Stripe not configured");
-    if (!STRIPE_WEBHOOK_SECRET) return res.status(500).send("Missing STRIPE_WEBHOOK_SECRET");
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  if (!stripe) return res.status(500).send("Stripe not configured");
+  if (!STRIPE_WEBHOOK_SECRET) return res.status(500).send("Missing STRIPE_WEBHOOK_SECRET");
 
-    let event;
-    try {
-      const sig = req.headers["stripe-signature"];
-      if (!sig) return res.status(400).send("Missing stripe-signature header");
-
-      event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
-    } catch (err) {
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    if (event.type === "payment_intent.succeeded") {
-      const pi = event.data.object;
-      console.log("✅ payment_intent.succeeded:", pi.id);
-      // Optional: update order status here if you map stripeIntentId -> orderNumber
-    }
-
-    if (event.type === "payment_intent.payment_failed") {
-      const pi = event.data.object;
-      console.log("❌ payment_intent.payment_failed:", pi.id);
-    }
-
-    res.json({ received: true });
+  let event;
+  try {
+    const sig = req.headers["stripe-signature"];
+    if (!sig) return res.status(400).send("Missing stripe-signature header");
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
   }
-);
+
+  if (event.type === "payment_intent.succeeded") {
+    const pi = event.data.object;
+    console.log("✅ payment_intent.succeeded:", pi.id);
+  }
+
+  if (event.type === "payment_intent.payment_failed") {
+    const pi = event.data.object;
+    console.log("❌ payment_intent.payment_failed:", pi.id);
+  }
+
+  res.json({ received: true });
+});
 
 // ✅ JSON middleware for everything else
 app.use(express.json({ limit: "1mb" }));
@@ -81,15 +71,10 @@ const HORIZONS_API_URL = (process.env.HORIZONS_API_URL || "https://api.horizons.
 const HORIZONS_STORE_ID = (process.env.HORIZONS_STORE_ID || "").trim();
 const HORIZONS_API_KEY = (process.env.HORIZONS_API_KEY || "").trim();
 
-// ✅ Server-side create store order (appears in Integrations → Store Manager)
 app.post("/api/store/create-order", async (req, res) => {
   try {
-    if (!HORIZONS_STORE_ID) {
-      return res.status(500).json({ success: false, error: "Missing HORIZONS_STORE_ID" });
-    }
-    if (!HORIZONS_API_KEY) {
-      return res.status(500).json({ success: false, error: "Missing HORIZONS_API_KEY" });
-    }
+    if (!HORIZONS_STORE_ID) return res.status(500).json({ success: false, error: "Missing HORIZONS_STORE_ID" });
+    if (!HORIZONS_API_KEY) return res.status(500).json({ success: false, error: "Missing HORIZONS_API_KEY" });
 
     const orderData = req.body || {};
     const {
@@ -104,12 +89,8 @@ app.post("/api/store/create-order", async (req, res) => {
     if (!orderNumber || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ success: false, error: "Missing orderNumber/items" });
     }
-    if (!customer?.email) {
-      return res.status(400).json({ success: false, error: "Missing customer.email" });
-    }
-    if (totals?.total == null) {
-      return res.status(400).json({ success: false, error: "Missing totals.total" });
-    }
+    if (!customer?.email) return res.status(400).json({ success: false, error: "Missing customer.email" });
+    if (totals?.total == null) return res.status(400).json({ success: false, error: "Missing totals.total" });
 
     const url = `${HORIZONS_API_URL}/stores/${encodeURIComponent(HORIZONS_STORE_ID)}/orders`;
 
@@ -129,10 +110,7 @@ app.post("/api/store/create-order", async (req, res) => {
         })),
         customer: {
           firstName: customer.firstName || String(customer.name || "").split(" ")[0] || "",
-          lastName:
-            customer.lastName ||
-            String(customer.name || "").split(" ").slice(1).join(" ") ||
-            "",
+          lastName: customer.lastName || String(customer.name || "").split(" ").slice(1).join(" ") || "",
           email: customer.email,
           phone: customer.phone || "",
         },
@@ -160,11 +138,7 @@ app.post("/api/store/create-order", async (req, res) => {
 
     const storeOrderId = data?.id || data?.orderId || null;
 
-    return res.json({
-      success: true,
-      storeOrderId,
-      data,
-    });
+    return res.json({ success: true, storeOrderId, data });
   } catch (e) {
     return res.status(500).json({ success: false, error: e?.message || String(e) });
   }
@@ -176,8 +150,6 @@ app.post("/api/stripe/create-payment-intent", async (req, res) => {
     if (!stripe) return res.status(500).json({ error: "Stripe not configured" });
 
     const { amount, currency = "eur", metadata = {} } = req.body || {};
-
-    // amount in integer cents
     if (!Number.isInteger(amount) || amount < 50) {
       return res.status(400).json({ error: "Invalid amount (integer cents, min 50)." });
     }
@@ -219,14 +191,11 @@ function generateOrderNumber() {
   return `ORD-${Date.now()}`;
 }
 
-// ✅ UPDATE ORDER METADATA
 function updateOrderMetadata(orderNumber, metadata) {
   const data = readOrders();
   const order = data.orders.find((o) => o.orderNumber === orderNumber);
-
   if (!order) throw new Error(`Order ${orderNumber} not found`);
 
-  // shallow merge
   order.metadata = { ...order.metadata, ...metadata };
   writeOrders(data);
   return order;
@@ -240,8 +209,7 @@ function toNum(x) {
 
 function priceToCents(item) {
   if (item?.price_in_cents != null) return Math.max(0, Math.round(toNum(item.price_in_cents)));
-  if (item?.variant?.price_in_cents != null)
-    return Math.max(0, Math.round(toNum(item.variant.price_in_cents)));
+  if (item?.variant?.price_in_cents != null) return Math.max(0, Math.round(toNum(item.variant.price_in_cents)));
 
   const eur =
     item?.price != null
@@ -268,13 +236,11 @@ app.post("/api/orders/create", async (req, res) => {
       discountAmount = 0,
     } = req.body || {};
 
-    // Validation
     if (!items.length) return res.status(400).json({ success: false, error: "No items in order" });
     if (!customer.name || !customer.email || !customer.phone) {
       return res.status(400).json({ success: false, error: "Missing customer details" });
     }
 
-    // ✅ totals in cents (avoid float errors, never trust client total)
     const subtotalCents = items.reduce((sum, item) => {
       const qty = Math.max(1, Math.round(toNum(item.quantity || 1)));
       return sum + priceToCents(item) * qty;
@@ -327,6 +293,7 @@ app.post("/api/orders/create", async (req, res) => {
           pickupName: boxnow.pickupName || null,
           pickupAddress: boxnow.pickupAddress || null,
           parcelId: null,
+          parcelIds: [],
           trackingNumber: null,
           labelUrl: null,
           error: null,
@@ -336,7 +303,6 @@ app.post("/api/orders/create", async (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
-    // Save order
     const data = readOrders();
     data.orders.push(order);
     writeOrders(data);
@@ -365,26 +331,22 @@ app.post("/api/orders/create", async (req, res) => {
   }
 });
 
-// ✅ GET ORDER (returns order + recomputed totals so old wrong totals get fixed)
+// ✅ GET ORDER (returns order + recomputed totals)
 app.get("/api/orders/:orderNumber", (req, res) => {
   try {
     const { orderNumber } = req.params;
     const data = readOrders();
     const order = data.orders.find((o) => o.orderNumber === orderNumber);
-
     if (!order) return res.status(404).json({ error: "Order not found" });
 
     const items = Array.isArray(order.items) ? order.items : [];
 
-    // recompute subtotal from stored items (prefer cents)
     const subtotalCents = items.reduce((sum, it) => {
       const qty = Math.max(1, Math.round(toNum(it?.quantity || 1)));
-
       const priceCents =
         it?.price_in_cents != null
           ? Math.max(0, Math.round(toNum(it.price_in_cents)))
           : Math.max(0, Math.round(toNum(it?.price || 0) * 100));
-
       return sum + priceCents * qty;
     }, 0);
 
@@ -401,10 +363,7 @@ app.get("/api/orders/:orderNumber", (req, res) => {
       _recomputed: true,
     };
 
-    return res.json({
-      ...order,
-      totals: fixedTotals,
-    });
+    return res.json({ ...order, totals: fixedTotals });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -419,8 +378,6 @@ const PARTNER_ID = (process.env.BOXNOW_PARTNER_ID || "").trim();
 const DEFAULT_ORIGIN_LOCATION_ID = String(process.env.BOXNOW_WAREHOUSE_ID || "2");
 
 const ALLOW_COD = String(process.env.BOXNOW_ALLOW_COD || "false").toLowerCase() === "true";
-
-// ✅ accept either env var name
 const FORCE_PREPAID = String(
   process.env.BOXNOW_FORCED_PREPAID ?? process.env.BOXNOW_FORCE_PREPAID_ST ?? "false"
 ).toLowerCase() === "true";
@@ -433,7 +390,12 @@ const MAIL_PORT = Number(process.env.MAIL_PORT || 465);
 const MAIL_SECURE = String(process.env.MAIL_SECURE || "true").toLowerCase() === "true";
 const MAIL_USER = (process.env.MAIL_USER || "").trim();
 const MAIL_PASS = process.env.MAIL_PASS || "";
+
+// Multiple recipients supported via comma
 const VOUCHER_EMAIL_TO = (process.env.VOUCHER_EMAIL_TO || MAIL_USER).trim();
+
+// ✅ BoxNow "official" email recipient (manual: notifyOnAccepted)
+const BOXNOW_NOTIFY_EMAIL = (process.env.BOXNOW_NOTIFY_EMAIL || "").trim();
 
 function mailEnabled() {
   return !!(MAIL_HOST && MAIL_PORT && MAIL_USER && MAIL_PASS && VOUCHER_EMAIL_TO);
@@ -511,7 +473,6 @@ function mapPaymentModeToBoxNow(method) {
     "pay on go",
     "boxnow_pay_on_the_go",
     "boxnow_pay_on_go",
-    "boxnow_pay_on_go",
   ];
 
   if (cod.includes(normalized)) return "cod";
@@ -520,10 +481,7 @@ function mapPaymentModeToBoxNow(method) {
 }
 
 /**
- * Parse KG from number/string:
- * - 0.22 / "0,22" / "0.22kg"
- * - "220" => grams heuristic => 0.22kg
- * - "220g" / "220gr"
+ * Parse KG from number/string
  */
 function parseKg(x) {
   if (x === null || x === undefined) return 0;
@@ -551,12 +509,7 @@ function parseKg(x) {
 }
 
 /**
- * ✅ TOTAL WEIGHT RULE (integration-first):
- * Priority:
- * 1) order.cartWeightKg (frontend computed canonical)
- * 2) order.weightKg / order.weight (if provided)
- * 3) sum(items[i].weightKg) * qty
- * 4) sum(items[i].weight) * qty
+ * ✅ TOTAL WEIGHT RULE
  */
 function computeTotalWeightKg(order) {
   const fromCart = parseKg(order?.cartWeightKg);
@@ -633,6 +586,7 @@ async function boxnowApiFetch(p, opts = {}) {
   });
 }
 
+// ✅ Manual supports label retrieval
 async function fetchBoxNowLabelPDF(orderNumber) {
   const token = await authToken();
   const url = `${API_BASE}/api/v1/delivery-requests/${encodeURIComponent(orderNumber)}/label.pdf`;
@@ -650,14 +604,43 @@ async function fetchBoxNowLabelPDF(orderNumber) {
 
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
-    throw new Error(`Label fetch failed (${r.status}): ct=${ct} body=${txt.slice(0, 200)}`);
+    throw new Error(`Label(order) fetch failed (${r.status}): ct=${ct} body=${txt.slice(0, 200)}`);
   }
 
   const buf = Buffer.from(await r.arrayBuffer());
-
   if (buf.length < 4 || buf.slice(0, 4).toString() !== "%PDF") {
     const preview = buf.slice(0, 200).toString("utf8");
-    throw new Error(`Label is not PDF: ct=${ct} bytes=${buf.length} preview=${preview}`);
+    throw new Error(`Label(order) is not PDF: ct=${ct} bytes=${buf.length} preview=${preview}`);
+  }
+
+  return buf;
+}
+
+// ✅ Preferred: label by parcelId (manual response includes parcels[].id)
+async function fetchBoxNowLabelPDFByParcelId(parcelId) {
+  const token = await authToken();
+  const url = `${API_BASE}/api/v1/parcels/${encodeURIComponent(parcelId)}/label.pdf`;
+
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 15000);
+
+  const r = await fetch(url, {
+    method: "GET",
+    signal: controller.signal,
+    headers: { ...buildHeaders(token), accept: "application/pdf" },
+  }).finally(() => clearTimeout(t));
+
+  const ct = (r.headers.get("content-type") || "").toLowerCase();
+
+  if (!r.ok) {
+    const txt = await r.text().catch(() => "");
+    throw new Error(`Label(parcel) fetch failed (${r.status}): ct=${ct} body=${txt.slice(0, 200)}`);
+  }
+
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length < 4 || buf.slice(0, 4).toString() !== "%PDF") {
+    const preview = buf.slice(0, 200).toString("utf8");
+    throw new Error(`Label(parcel) is not PDF: ct=${ct} bytes=${buf.length} preview=${preview}`);
   }
 
   return buf;
@@ -722,7 +705,7 @@ app.get("/api/boxnow/origins", async (req, res) => {
   }
 });
 
-// ✅ UPDATED delivery-requests (stores metadata + emails voucher)
+// ✅ UPDATED delivery-requests (manual-compliant parcels parsing + notifyOnAccepted + dual email)
 app.post("/api/boxnow/delivery-requests", async (req, res) => {
   try {
     const order = req.body || {};
@@ -744,12 +727,10 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
 
     const originLocationId = String(order.originLocationId || DEFAULT_ORIGIN_LOCATION_ID);
 
-    // ✅ USE orderNumber from order (not generate new)
     const orderNumber = String(order.orderNumber || `ORD-${Date.now()}`);
     const invoiceValueNum = Number(order.invoiceValue ?? order.total ?? order.amountToBeCollected ?? 0);
     const invoiceValue = safeMoney(invoiceValueNum);
 
-    // Accept either paymentMode OR paymentMethod from frontend
     let paymentMode = mapPaymentModeToBoxNow(order.paymentMode ?? order.paymentMethod);
     if (FORCE_PREPAID) paymentMode = "prepaid";
     if (paymentMode === "cod" && !ALLOW_COD) paymentMode = "prepaid";
@@ -781,11 +762,18 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
 
     const compartmentSize = totalWeightKg <= 5 ? 2 : 3;
 
+    // ✅ BoxNow manual: send email only if notifyOnAccepted is populated
+    const notifyEmail = (BOXNOW_NOTIFY_EMAIL || VOUCHER_EMAIL_TO.split(",")[0] || MAIL_USER).trim();
+
     const deliveryRequest = {
       orderNumber,
       invoiceValue,
       paymentMode,
       amountToBeCollected,
+
+      // ✅ official BoxNow voucher email
+      notifyOnAccepted: notifyEmail,
+
       origin: {
         locationId: originLocationId,
         contactName: String(customerName),
@@ -811,7 +799,13 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
       ],
     };
 
-    console.log("[BOXNOW_REQUEST]", { orderNumber, destinationLocationId, totalWeightKg, paymentMode });
+    console.log("[BOXNOW_REQUEST]", {
+      orderNumber,
+      destinationLocationId,
+      totalWeightKg,
+      paymentMode,
+      notifyOnAccepted: notifyEmail,
+    });
 
     const r = await boxnowApiFetch("/api/v1/delivery-requests", {
       method: "POST",
@@ -831,10 +825,23 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
     }
 
     const responseData = JSON.parse(text);
-    const parcelId = responseData?.id || responseData?.parcelId;
-    const trackingNumber = responseData?.trackingNumber || responseData?.referenceNumber;
 
-    console.log("[BOXNOW_SUCCESS]", { orderNumber, parcelId, trackingNumber });
+    // ✅ Manual response: { id: <deliveryRequestId>, parcels: [{ id: <parcelId> }, ...] }
+    const deliveryRequestId = responseData?.id || null;
+
+    const parcelIds = Array.isArray(responseData?.parcels)
+      ? responseData.parcels.map((p) => String(p?.id || "").trim()).filter(Boolean)
+      : [];
+
+    const parcelId = parcelIds[0] || null;
+
+    const trackingNumber =
+      responseData?.trackingNumber ||
+      responseData?.referenceNumber ||
+      responseData?.parcels?.[0]?.trackingNumber ||
+      null;
+
+    console.log("[BOXNOW_SUCCESS]", { orderNumber, deliveryRequestId, parcelIds, trackingNumber });
 
     try {
       updateOrderMetadata(orderNumber, {
@@ -843,6 +850,7 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
           pickupName: order.pickupName || null,
           pickupAddress: order.pickupAddress || null,
           parcelId,
+          parcelIds,
           trackingNumber,
           labelUrl: null,
           error: null,
@@ -852,11 +860,18 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
       console.error("[METADATA_UPDATE_ERROR]", err.message);
     }
 
-    // ✅ Render-safe: fetch label + send email BEFORE ending request
+    // ✅ Send our own voucher copy to multiple recipients
     let voucherEmail = { sent: false, reason: "not_attempted" };
     try {
-      console.log("[VOUCHER] fetching label pdf...", { orderNumber });
-      const pdf = await fetchBoxNowLabelPDF(orderNumber);
+      console.log("[VOUCHER] fetching label pdf...", { orderNumber, parcelId });
+
+      // Prefer parcel label; fallback to order label (both described in manual)
+      let pdf;
+      if (parcelId) {
+        pdf = await fetchBoxNowLabelPDFByParcelId(parcelId);
+      } else {
+        pdf = await fetchBoxNowLabelPDF(orderNumber);
+      }
 
       console.log("[VOUCHER] sending email...", { orderNumber, to: VOUCHER_EMAIL_TO || MAIL_USER });
       voucherEmail = await emailVoucherPdf({ orderNumber, pdfBuffer: pdf });
@@ -867,19 +882,23 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
       voucherEmail = { sent: false, reason: err?.message || String(err) };
     }
 
-    res.json({
+    return res.json({
       success: true,
-      parcelId,
-      trackingNumber,
       orderNumber,
+      deliveryRequestId,
+      parcelId,
+      parcelIds,
+      trackingNumber,
       voucherEmail,
+      notifyOnAccepted: notifyEmail,
     });
   } catch (e) {
     console.error("[BOXNOW_ERROR]", e?.message || e);
-    res.status(502).json({ message: "BoxNow error", details: String(e?.message || e) });
+    return res.status(502).json({ message: "BoxNow error", details: String(e?.message || e) });
   }
 });
 
+// Optional: serve label pdf by orderNumber (manual supports)
 app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
   try {
     const orderNumber = String(req.params.orderNumber || "").trim();
@@ -891,9 +910,23 @@ app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
     res.setHeader("Content-Disposition", `inline; filename="BOXNOW-${orderNumber}.pdf"`);
     return res.status(200).send(pdf);
   } catch (e) {
-    return res
-      .status(502)
-      .json({ message: "BoxNow order label error", details: String(e?.message || e) });
+    return res.status(502).json({ message: "BoxNow order label error", details: String(e?.message || e) });
+  }
+});
+
+// Optional: serve label pdf by parcelId
+app.get("/api/boxnow/labels/parcel/:parcelId", async (req, res) => {
+  try {
+    const parcelId = String(req.params.parcelId || "").trim();
+    if (!parcelId) return res.status(400).json({ error: "Missing parcelId" });
+
+    const pdf = await fetchBoxNowLabelPDFByParcelId(parcelId);
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="BOXNOW-PARCEL-${parcelId}.pdf"`);
+    return res.status(200).send(pdf);
+  } catch (e) {
+    return res.status(502).json({ message: "BoxNow parcel label error", details: String(e?.message || e) });
   }
 });
 
