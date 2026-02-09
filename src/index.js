@@ -398,7 +398,7 @@ app.get("/api/orders/:orderNumber", (req, res) => {
       shipping: Number((shippingCents / 100).toFixed(2)),
       discount: Number((discountCents / 100).toFixed(2)),
       total: Number((totalCents / 100).toFixed(2)),
-      _recomputed: true, // 👈 για να βλέπεις ότι όντως τρέχει ο νέος κώδικας
+      _recomputed: true,
     };
 
     return res.json({
@@ -510,6 +510,7 @@ function mapPaymentModeToBoxNow(method) {
     "pay_on_go",
     "pay on go",
     "boxnow_pay_on_the_go",
+    "boxnow_pay_on_go",
     "boxnow_pay_on_go",
   ];
 
@@ -636,17 +637,30 @@ async function fetchBoxNowLabelPDF(orderNumber) {
   const token = await authToken();
   const url = `${API_BASE}/api/v1/delivery-requests/${encodeURIComponent(orderNumber)}/label.pdf`;
 
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 15000);
+
   const r = await fetch(url, {
     method: "GET",
+    signal: controller.signal,
     headers: { ...buildHeaders(token), accept: "application/pdf" },
-  });
+  }).finally(() => clearTimeout(t));
+
+  const ct = (r.headers.get("content-type") || "").toLowerCase();
 
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
-    throw new Error(`Label fetch failed (${r.status}): ${txt.slice(0, 200)}`);
+    throw new Error(`Label fetch failed (${r.status}): ct=${ct} body=${txt.slice(0, 200)}`);
   }
 
-  return Buffer.from(await r.arrayBuffer());
+  const buf = Buffer.from(await r.arrayBuffer());
+
+  if (buf.length < 4 || buf.slice(0, 4).toString() !== "%PDF") {
+    const preview = buf.slice(0, 200).toString("utf8");
+    throw new Error(`Label is not PDF: ct=${ct} bytes=${buf.length} preview=${preview}`);
+  }
+
+  return buf;
 }
 
 async function emailVoucherPdf({ orderNumber, pdfBuffer }) {
@@ -654,6 +668,9 @@ async function emailVoucherPdf({ orderNumber, pdfBuffer }) {
   if (!transporter) return { sent: false, reason: "mail_not_configured" };
 
   const toList = VOUCHER_EMAIL_TO.split(",").map((s) => s.trim()).filter(Boolean);
+  if (!toList.length) return { sent: false, reason: "empty_recipient_list" };
+
+  console.log("[VOUCHER_EMAIL]", { orderNumber, to: toList, bytes: pdfBuffer?.length || 0 });
 
   await transporter.sendMail({
     from: `"Gods n Bees" <${MAIL_USER}>`,
@@ -720,7 +737,10 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
     const customerPhone = normalizePhone(customerPhoneRaw);
 
     const destinationLocationId =
-      order.destinationLocationId ?? order.destination?.locationId ?? order.selectedLockerId ?? order.lockerId;
+      order.destinationLocationId ??
+      order.destination?.locationId ??
+      order.selectedLockerId ??
+      order.lockerId;
 
     const originLocationId = String(order.originLocationId || DEFAULT_ORIGIN_LOCATION_ID);
 
@@ -832,22 +852,27 @@ app.post("/api/boxnow/delivery-requests", async (req, res) => {
       console.error("[METADATA_UPDATE_ERROR]", err.message);
     }
 
-    // fire-and-forget voucher email
-    (async () => {
-      try {
-        const pdf = await fetchBoxNowLabelPDF(orderNumber);
-        const emailResult = await emailVoucherPdf({ orderNumber, pdfBuffer: pdf });
-        console.log("[EMAIL_SENT]", { orderNumber, ...emailResult });
-      } catch (err) {
-        console.error("[EMAIL_ERROR]", { orderNumber, error: err?.message || String(err) });
-      }
-    })();
+    // ✅ Render-safe: fetch label + send email BEFORE ending request
+    let voucherEmail = { sent: false, reason: "not_attempted" };
+    try {
+      console.log("[VOUCHER] fetching label pdf...", { orderNumber });
+      const pdf = await fetchBoxNowLabelPDF(orderNumber);
+
+      console.log("[VOUCHER] sending email...", { orderNumber, to: VOUCHER_EMAIL_TO || MAIL_USER });
+      voucherEmail = await emailVoucherPdf({ orderNumber, pdfBuffer: pdf });
+
+      console.log("[EMAIL_SENT]", { orderNumber, ...voucherEmail });
+    } catch (err) {
+      console.error("[EMAIL_ERROR]", { orderNumber, error: err?.message || String(err) });
+      voucherEmail = { sent: false, reason: err?.message || String(err) };
+    }
 
     res.json({
       success: true,
       parcelId,
       trackingNumber,
       orderNumber,
+      voucherEmail,
     });
   } catch (e) {
     console.error("[BOXNOW_ERROR]", e?.message || e);
@@ -874,5 +899,3 @@ app.get("/api/boxnow/labels/order/:orderNumber", async (req, res) => {
 
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => console.log(`BoxNow server running on port ${PORT}`));
-
-
